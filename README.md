@@ -6,18 +6,48 @@ Automated bash script that queries your K10 cluster and sends a styled HTML emai
 
 | Section | Source |
 |---|---|
-| Applications & compliance | `apps.applications.kio.kasten.io` CRs |
-| License validity & expiry | `licenses.vault.kio.kasten.io` / `licenses.licensing.kio.kasten.io` CRs |
-| Consumption (nodes & apps) | License CR status + `kubectl get nodes` fallback |
+| Applications & compliance | `applications.apps.kio.kasten.io` CRs |
+| License validity & expiry | `k10-license` secret (YAML decoded) |
+| Consumption (nodes & apps) | License secret + `oc get nodes` fallback |
 | Policies (backup/import/system) | `policies.config.kio.kasten.io` CRs |
 | Last policy run status & errors | `runactions.actions.kio.kasten.io` CRs |
 | Daily action counts (3 days) | RunAction timestamps |
-| Storage stats | `clusterreports.reporting.kio.kasten.io` or PVCs |
+| Storage stats | `reports.reporting.kio.kasten.io` or PVCs |
 | Services health | Deployment readiness in kasten-io namespace |
+
+## Output files
+
+Each run produces two files in `REPORT_DIR` (default `/tmp/kasten-reports`):
+
+| File | Purpose |
+|---|---|
+| `kasten-report-YYYY-MM-DD.html` | Styled visual report |
+| `kasten-report-YYYY-MM-DD.json` | Structured data for automation/dashboards |
+
+When sending email, the HTML is the **email body** and the JSON is **attached** as a file.
+
+### JSON structure
+
+```json
+{
+  "reportDate": "2026-03-08",
+  "reportTime": "08:00 CET",
+  "cluster": { "name": "...", "instanceId": "...", "kastenVersion": "8.5.3" },
+  "applications": { "total": 79, "compliant": 0, "nonCompliant": 0, "unmanaged": 79 },
+  "policies": { "total": 3, "backup": 2, "import": 0, "system": 1, "details": [...] },
+  "storage": { "totalBackupData": "90.9 MiB", "snapshotSize": "0 B", "objectStorage": "91 MiB" },
+  "license": { "customer": "...", "product": "K10", "expires": "...", "daysLeft": 26962,
+               "consumption": { "nodes": { "used": 3, "licensed": 10, "percent": 30 }, ... } },
+  "services": { "allHealthy": true, "details": [...] }
+}
+```
 
 ## Quick start
 
 ```bash
+# Switch to kasten-io project (OpenShift)
+oc project kasten-io
+
 # Minimal — just generate the HTML file locally
 ./kasten-morning-report.sh
 
@@ -60,11 +90,18 @@ MAIL_TO="team@example.com" MAIL_METHOD=mailx ./kasten-morning-report.sh
 
 ## Multi-cluster
 
-Run the script once per kubeconfig context:
+Run the script once per context/project:
 
 ```bash
+# OpenShift
 for ctx in cluster-prod cluster-staging cluster-dev; do
-    KUBECONFIG=~/.kube/config \
+    oc login "$ctx" --token=...
+    oc project kasten-io
+    CLUSTER_NAME="$ctx" MAIL_TO="team@example.com" ./kasten-morning-report.sh
+done
+
+# Vanilla K8s
+for ctx in cluster-prod cluster-staging cluster-dev; do
     kubectl config use-context "$ctx"
     CLUSTER_NAME="$ctx" MAIL_TO="team@example.com" ./kasten-morning-report.sh
 done
@@ -87,6 +124,7 @@ The script tries multiple CRDs in order: `licenses.vault.kio.kasten.io` (K10 7.x
 
 ## Requirements
 
-- `kubectl` with access to the target cluster
+- `oc` (OpenShift) or `kubectl` — auto-detected, `oc` preferred
 - `jq` for JSON parsing
 - `python3` (for SMTP email) or `sendmail`/`mailx`
+- Works on **macOS** (BSD) and **Linux** (GNU) — no `grep -P` or GNU-only date flags
