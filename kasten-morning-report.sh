@@ -3,8 +3,23 @@
 #  Kasten K10 — Morning Coffee Report
 #  Gathers cluster data via oc/kubectl + K10 API and sends an HTML email.
 #  Compatible: macOS (BSD bash 3.2+) + Linux, OpenShift (oc) + vanilla K8s
+#
+#  CHANGELOG (review 2026-05):
+#    - OpenShift auto-detection (route.openshift.io + clusterversion probe).
+#      If OCP cluster detected but 'oc' missing → exit error.
+#    - SMTP heredoc hardened: quoted heredoc + os.environ (no shell injection).
+#    - HTML escaping for all cluster-derived strings (policy names, errors,
+#      customer name, license ID, service names).
+#    - Single get for runactions in get_report_actions and get_policies
+#      (was N+1 per policy / x3 per day).
+#    - Normalized status matching (handles 'failed', 'error*', 'fail*').
+#    - Robust import-policy detection via jq `any()`.
+#    - Image tag extraction strips @sha256 before splitting on ':'.
+#    - Dead app-license code removed (K10 licences nodes, not apps).
+#    - Non-compliance + failed-policy alert banner added above overview.
+#    - SMTP_PASS_FILE support (file with 0600 perms recommended).
+#    - Optional retention cleanup (RETENTION_DAYS, default 30, set to 0 to disable).
 # ═══════════════════════════════════════════════════════════════════════════════
-# NOTE: Do NOT use "set -e" — [[ ]] && patterns return non-zero on false
 set -uo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -19,20 +34,56 @@ SMTP_SERVER="${SMTP_SERVER:-localhost}"
 SMTP_PORT="${SMTP_PORT:-25}"
 SMTP_USER="${SMTP_USER:-}"
 SMTP_PASS="${SMTP_PASS:-}"
+SMTP_PASS_FILE="${SMTP_PASS_FILE:-}"
 SMTP_TLS="${SMTP_TLS:-false}"
 
 REPORT_DIR="${REPORT_DIR:-/tmp/kasten-reports}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
 CLUSTER_NAME="${CLUSTER_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
 
-# ─── Auto-detect CLI: prefer oc, fallback to kubectl ──────────────────────────
-if command -v oc >/dev/null 2>&1; then
-    K="oc"
-elif command -v kubectl >/dev/null 2>&1; then
-    K="kubectl"
-else
-    echo "ERROR: Neither 'oc' nor 'kubectl' found in PATH" >&2; exit 1
+# Resolve SMTP_PASS from file if SMTP_PASS_FILE is set
+if [[ -n "${SMTP_PASS_FILE}" && -r "${SMTP_PASS_FILE}" ]]; then
+    SMTP_PASS="$(cat "${SMTP_PASS_FILE}")"
 fi
+
+# ─── CLI selection: OpenShift-aware ───────────────────────────────────────────
+detect_cli() {
+    local has_oc=false has_kubectl=false
+    command -v oc      >/dev/null 2>&1 && has_oc=true
+    command -v kubectl >/dev/null 2>&1 && has_kubectl=true
+
+    if ! ${has_oc} && ! ${has_kubectl}; then
+        echo "ERROR: Neither 'oc' nor 'kubectl' found in PATH" >&2; exit 1
+    fi
+
+    # Probe with whichever CLI is available (oc preferred for the probe)
+    local probe="kubectl"
+    ${has_oc} && probe="oc"
+
+    IS_OPENSHIFT=false
+    if ${probe} api-resources --api-group=route.openshift.io >/dev/null 2>&1 \
+       && ${probe} get clusterversion >/dev/null 2>&1; then
+        IS_OPENSHIFT=true
+    fi
+
+    if ${IS_OPENSHIFT}; then
+        if ! ${has_oc}; then
+            echo "ERROR: OpenShift cluster detected but 'oc' is not installed." >&2
+            echo "       Install 'oc' from https://access.redhat.com/downloads/content/290" >&2
+            exit 1
+        fi
+        K="oc"
+    else
+        if ${has_kubectl}; then
+            K="kubectl"
+        else
+            K="oc"
+        fi
+    fi
+}
+
+detect_cli
 
 # ─── Portable helpers (macOS BSD + Linux GNU) ─────────────────────────────────
 portable_date_fmt() {
@@ -68,9 +119,20 @@ date_short_label() {
     echo "${result}" | sed 's/  */ /g'
 }
 
-# Bash 3.2 safe lowercase (no ${var,,})
+# Bash 3.2 safe lowercase
 to_lower() {
     echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# HTML escaping for any cluster-derived string before injection into the HTML
+html_escape() {
+    local s="${1:-}"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    s="${s//\'/&#39;}"
+    printf '%s' "${s}"
 }
 
 # ─── Date constants ───────────────────────────────────────────────────────────
@@ -78,6 +140,7 @@ TODAY=$(date +"%Y-%m-%d")
 TODAY_PRETTY=$(date +"%A, %B %d, %Y")
 TIME_NOW=$(date +"%H:%M %Z")
 REPORT_FILE="${REPORT_DIR}/kasten-report-${TODAY}.html"
+JSON_FILE="${REPORT_DIR}/kasten-report-${TODAY}.json"
 
 mkdir -p "${REPORT_DIR}"
 
@@ -91,7 +154,7 @@ if ! ${K} cluster-info >/dev/null 2>&1 && ! ${K} whoami >/dev/null 2>&1; then
 fi
 
 log "Starting Kasten K10 Morning Coffee Report collection..."
-log "Using CLI: ${K}"
+log "CLI: ${K} | OpenShift detected: ${IS_OPENSHIFT}"
 
 if [[ -z "${CLUSTER_NAME}" ]]; then
     CLUSTER_NAME=$(${K} config current-context 2>/dev/null || echo "unknown-cluster")
@@ -109,24 +172,25 @@ log "Cluster: ${CLUSTER_NAME} | Namespace: ${KASTEN_NAMESPACE}"
 # ─── Kasten version (from deployment label, not image tag) ────────────────────
 get_kasten_version() {
     local version
-    # Best source: Helm app.kubernetes.io/version label
     version=$(${K} get deploy -n "${KASTEN_NAMESPACE}" -l app="${KASTEN_RELEASE}" \
         -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/version}' 2>/dev/null || true)
 
     if [[ -z "${version}" ]]; then
-        # Fallback: helm.sh/chart label (e.g. "k10-8.5.3" → "8.5.3")
         version=$(${K} get deploy -n "${KASTEN_NAMESPACE}" -l app="${KASTEN_RELEASE}" \
             -o jsonpath='{.items[0].metadata.labels.helm\.sh/chart}' 2>/dev/null \
             | sed 's/^k10-//' || true)
     fi
 
     if [[ -z "${version}" ]]; then
-        # Last resort: image tag (skip if digest-only)
+        # Last resort: image tag. Strip @sha256 digest before splitting on ':'
         local img
         img=$(${K} get deploy -n "${KASTEN_NAMESPACE}" -l app="${KASTEN_RELEASE}" \
             -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || true)
-        if echo "${img}" | grep -q ':' && ! echo "${img}" | grep -q '@sha256'; then
-            version=$(echo "${img}" | sed 's/.*://')
+        if [[ -n "${img}" ]]; then
+            img="${img%@sha256:*}"   # remove digest suffix if present
+            if echo "${img}" | grep -q ':'; then
+                version=$(echo "${img}" | sed 's/.*://')
+            fi
         fi
     fi
 
@@ -134,7 +198,6 @@ get_kasten_version() {
 }
 
 # ─── Applications ─────────────────────────────────────────────────────────────
-#  CRD: applications.apps.kio.kasten.io
 get_applications() {
     local apps_json
     apps_json=$(${K} get applications.apps.kio.kasten.io --all-namespaces -o json 2>/dev/null || echo '{"items":[]}')
@@ -153,15 +216,22 @@ get_applications() {
     fi
 }
 
+# ─── Run actions: single fetch, reused everywhere ─────────────────────────────
+# Cached JSON of all runactions in the namespace, sorted by creation timestamp.
+RUNACTIONS_JSON=""
+load_runactions() {
+    RUNACTIONS_JSON=$(${K} get runactions.actions.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
+        --sort-by='.metadata.creationTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
+}
+
 # ─── Policies ─────────────────────────────────────────────────────────────────
-#  CRD: policies.config.kio.kasten.io
 get_policies() {
     local policies_json
     policies_json=$(${K} get policies.config.kio.kasten.io -n "${KASTEN_NAMESPACE}" -o json 2>/dev/null || echo '{"items":[]}')
 
     TOTAL_POLICIES=$(echo "${policies_json}" | jq '.items | length' 2>/dev/null || echo "0")
-    BACKUP_POLICIES=$(echo "${policies_json}" | jq '[.items[] | select(.spec.actions[]?.action=="backup")] | length' 2>/dev/null || echo "0")
-    IMPORT_POLICIES=$(echo "${policies_json}" | jq '[.items[] | select(.spec.actions[]?.action=="import")] | length' 2>/dev/null || echo "0")
+    BACKUP_POLICIES=$(echo "${policies_json}" | jq '[.items[] | select(any(.spec.actions[]?; .action == "backup"))] | length' 2>/dev/null || echo "0")
+    IMPORT_POLICIES=$(echo "${policies_json}" | jq '[.items[] | select(any(.spec.actions[]?; .action == "import"))] | length' 2>/dev/null || echo "0")
     SYSTEM_POLICIES=$(echo "${policies_json}" | jq '[.items[] | select(.metadata.labels["k10.kasten.io/isSystemPolicy"]=="true")] | length' 2>/dev/null || echo "0")
 
     POLICY_NAMES=()
@@ -179,19 +249,18 @@ get_policies() {
         name=$(echo "${policies_json}" | jq -r ".items[${i}].metadata.name")
         type_val=$(echo "${policies_json}" | jq -r "
             if .items[${i}].metadata.labels[\"k10.kasten.io/isSystemPolicy\"] == \"true\" then \"System\"
-            elif (.items[${i}].spec.actions[]?.action // \"\" ) == \"import\" then \"Import\"
+            elif any(.items[${i}].spec.actions[]?; .action == \"import\") then \"Import\"
             else \"Backup\"
             end" 2>/dev/null || echo "Backup")
 
         POLICY_NAMES+=("${name}")
         POLICY_TYPES+=("${type_val}")
 
-        # CRD: runactions.actions.kio.kasten.io
+        # Filter the cached runactions for this policy (no extra API call)
         local run_json last_status last_time action_count error_msg run_count
-        run_json=$(${K} get runactions.actions.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
-            -l "k10.kasten.io/policyName=${name}" \
-            --sort-by='.metadata.creationTimestamp' \
-            -o json 2>/dev/null || echo '{"items":[]}')
+        run_json=$(echo "${RUNACTIONS_JSON}" | jq --arg p "${name}" \
+            '{items: [.items[] | select(.metadata.labels["k10.kasten.io/policyName"] == $p)]}' 2>/dev/null \
+            || echo '{"items":[]}')
 
         run_count=$(echo "${run_json}" | jq '.items | length')
         if [[ "${run_count}" -gt 0 ]]; then
@@ -200,7 +269,6 @@ get_policies() {
             action_count=$(echo "${run_json}" | jq -r '.items[-1].status.actions // 0')
             error_msg=$(echo "${run_json}" | jq -r '.items[-1].status.error // ""')
 
-            # Bash 3.2 safe lowercase
             local lower_status
             lower_status=$(to_lower "${last_status}")
             case "${lower_status}" in
@@ -230,8 +298,7 @@ get_policies() {
     done
 }
 
-# ─── Actions / Report data (last 3 days) ─────────────────────────────────────
-#  CRD: runactions.actions.kio.kasten.io
+# ─── Daily action counts (last 3 days) ────────────────────────────────────────
 get_report_actions() {
     REPORT_ROWS=""
     local days_ago
@@ -242,15 +309,20 @@ get_report_actions() {
         start_label=$(date_short_label "${start_date}")
         end_label=$(date_short_label "${end_date}")
 
-        local actions_json total_actions error_actions
-        actions_json=$(${K} get runactions.actions.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
-            --sort-by='.metadata.creationTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
+        local total_actions error_actions
+        total_actions=$(echo "${RUNACTIONS_JSON}" | jq \
+            --arg s "${start_date}T00:00:00Z" --arg e "${end_date}T23:59:59Z" \
+            '[.items[] | select(.metadata.creationTimestamp >= $s and .metadata.creationTimestamp <= $e)] | length' \
+            2>/dev/null || echo "0")
 
-        total_actions=$(echo "${actions_json}" | jq --arg s "${start_date}T00:00:00Z" --arg e "${end_date}T23:59:59Z" \
-            '[.items[] | select(.metadata.creationTimestamp >= $s and .metadata.creationTimestamp <= $e)] | length' 2>/dev/null || echo "0")
-
-        error_actions=$(echo "${actions_json}" | jq --arg s "${start_date}T00:00:00Z" --arg e "${end_date}T23:59:59Z" \
-            '[.items[] | select(.metadata.creationTimestamp >= $s and .metadata.creationTimestamp <= $e) | select(.status.state=="Failed" or .status.state=="failed")] | length' 2>/dev/null || echo "0")
+        # Normalize state matching: handles "Failed", "failed", "Error", "fail*", "error*"
+        error_actions=$(echo "${RUNACTIONS_JSON}" | jq \
+            --arg s "${start_date}T00:00:00Z" --arg e "${end_date}T23:59:59Z" \
+            '[.items[]
+              | select(.metadata.creationTimestamp >= $s and .metadata.creationTimestamp <= $e)
+              | select((.status.state // "" | ascii_downcase) | test("^(fail|error)"))
+             ] | length' \
+            2>/dev/null || echo "0")
 
         local error_color="#27AE60"
         if [[ "${error_actions}" -gt 0 ]]; then error_color="#E74C3C"; fi
@@ -268,14 +340,11 @@ get_report_actions() {
 }
 
 # ─── Storage & Report Data ────────────────────────────────────────────────────
-#  CRD: reports.reporting.kio.kasten.io
-#  K10 reports use .results (not .status.stats)
 get_storage_info() {
     SNAPSHOT_SIZE="N/A"
     OBJECT_STORAGE="N/A"
     TOTAL_BACKUP_DATA="N/A"
 
-    # Also enrich compliance + action stats from the report
     REPORT_COMPLIANCE_APPS=""
     REPORT_COMPLIANCE_COMPLIANT=""
     REPORT_COMPLIANCE_NONCOMPLIANT=""
@@ -291,13 +360,10 @@ get_storage_info() {
         local last_report
         last_report=$(echo "${report_json}" | jq '.items[-1]')
 
-        # ── Log available keys for diagnostics ──
         local result_keys
         result_keys=$(echo "${last_report}" | jq -r '.results | keys | join(", ")' 2>/dev/null || echo "none")
         log "  → Report .results keys: ${result_keys}"
 
-        # ── Storage — search through all known and possible paths ──
-        # Try .results.storage, .results.dataUsage, .results.protection, .results.general
         TOTAL_BACKUP_DATA=$(echo "${last_report}" | jq -r '
             (.results.storage.totalBackupData //
              .results.storage.totalSize //
@@ -324,9 +390,7 @@ get_storage_info() {
              null)
         ' 2>/dev/null || true)
 
-        # ── If storage not found, search all numeric fields recursively ──
         if [[ -z "${TOTAL_BACKUP_DATA}" || "${TOTAL_BACKUP_DATA}" == "null" ]]; then
-            # Dump all keys that contain "size" or "storage" or "data" anywhere in results
             local size_fields
             size_fields=$(echo "${last_report}" | jq -r '
                 [path(.. | numbers) | map(tostring) | join(".")]
@@ -340,18 +404,14 @@ get_storage_info() {
             fi
         fi
 
-        # Clean up null/empty
         if [[ -z "${TOTAL_BACKUP_DATA}" || "${TOTAL_BACKUP_DATA}" == "null" ]]; then TOTAL_BACKUP_DATA="N/A"; fi
-        if [[ -z "${SNAPSHOT_SIZE}" || "${SNAPSHOT_SIZE}" == "null" ]]; then SNAPSHOT_SIZE="N/A"; fi
-        if [[ -z "${OBJECT_STORAGE}" || "${OBJECT_STORAGE}" == "null" ]]; then OBJECT_STORAGE="N/A"; fi
+        if [[ -z "${SNAPSHOT_SIZE}"     || "${SNAPSHOT_SIZE}"     == "null" ]]; then SNAPSHOT_SIZE="N/A"; fi
+        if [[ -z "${OBJECT_STORAGE}"    || "${OBJECT_STORAGE}"    == "null" ]]; then OBJECT_STORAGE="N/A"; fi
 
-        # Compliance from report (authoritative source)
         REPORT_COMPLIANCE_APPS=$(echo "${last_report}" | jq -r '.results.compliance.applicationCount // empty' 2>/dev/null || true)
         REPORT_COMPLIANCE_COMPLIANT=$(echo "${last_report}" | jq -r '.results.compliance.compliantCount // empty' 2>/dev/null || true)
         REPORT_COMPLIANCE_NONCOMPLIANT=$(echo "${last_report}" | jq -r '.results.compliance.nonCompliantCount // empty' 2>/dev/null || true)
         REPORT_COMPLIANCE_UNMANAGED=$(echo "${last_report}" | jq -r '.results.compliance.unmanagedCount // empty' 2>/dev/null || true)
-
-        # K10 version from report
         REPORT_K10_VERSION=$(echo "${last_report}" | jq -r '.results.general.k10Version // empty' 2>/dev/null || true)
     fi
 
@@ -417,9 +477,8 @@ get_services_status() {
 }
 
 # ─── License & Consumption ────────────────────────────────────────────────────
-#  K10 license is stored in secret "k10-license" as YAML (not JSON!)
-#  Fields: customerName, dateEnd, dateStart, features, id, product, restrictions.nodes
-# Helper: extract a YAML value by key (simple flat YAML only)
+# K10 license is stored in secret "k10-license" as YAML.
+# Fields: customerName, dateEnd, dateStart, features, id, product, restrictions.nodes
 yaml_val() {
     local yaml="$1" key="$2"
     echo "${yaml}" | grep -m1 "^${key}:" | sed "s/^${key}:[[:space:]]*//" | sed "s/^['\"]//;s/['\"]$//"
@@ -431,18 +490,15 @@ get_license_info() {
     LIC_ISSUED="N/A"; LIC_EXPIRES="N/A"; LIC_DAYS_LEFT="N/A"
     LIC_STATUS="Unknown"; LIC_STATUS_COLOR="#999999"; LIC_FEATURES=""
     LIC_NODE_LICENSED="N/A"; LIC_NODE_USED="N/A"; LIC_NODE_PCT="0"
-    LIC_APP_LICENSED="N/A"; LIC_APP_USED="N/A"; LIC_APP_PCT="0"
 
-    # ── Decode k10-license secret (YAML format) ──
     local raw_b64 decoded
     raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" k10-license -o jsonpath='{.data.license}' 2>/dev/null || true)
 
     if [[ -n "${raw_b64}" ]]; then
-        # macOS uses -D, Linux uses -d
         decoded=$(echo "${raw_b64}" | base64 -d 2>/dev/null || echo "${raw_b64}" | base64 -D 2>/dev/null || true)
     fi
 
-    if [[ -n "${decoded}" ]]; then
+    if [[ -n "${decoded:-}" ]]; then
         LIC_CUSTOMER=$(yaml_val "${decoded}" "customerName")
         LIC_TYPE=$(yaml_val "${decoded}" "product")
         LIC_ID=$(yaml_val "${decoded}" "id")
@@ -455,7 +511,6 @@ get_license_info() {
             LIC_FEATURES="${features_val}"
         fi
 
-        # restrictions.nodes is indented under restrictions:
         LIC_NODE_LICENSED=$(echo "${decoded}" | grep -m1 "nodes:" | sed "s/.*nodes:[[:space:]]*//" | sed "s/^['\"]//;s/['\"]$//")
         if [[ -z "${LIC_NODE_LICENSED}" ]]; then
             LIC_NODE_LICENSED="Unlimited"
@@ -464,8 +519,8 @@ get_license_info() {
         LIC_PLATFORM="Kubernetes"
     fi
 
-    # ── Fallback: check for license secrets with other names ──
-    if [[ -z "${decoded}" ]]; then
+    # Fallback: license secrets with alternate names
+    if [[ -z "${decoded:-}" ]]; then
         local lic_secret_name
         lic_secret_name=$(${K} get secrets -n "${KASTEN_NAMESPACE}" --no-headers 2>/dev/null \
             | grep -i license | head -1 | awk '{print $1}' || true)
@@ -490,17 +545,12 @@ get_license_info() {
         fi
     fi
 
-    # ── Node count ──
+    # Node count (live cluster)
     if [[ "${LIC_NODE_USED}" == "N/A" || "${LIC_NODE_USED}" == "null" || -z "${LIC_NODE_USED}" ]]; then
         LIC_NODE_USED=$(${K} get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
     fi
-    # ── App count ──
-    if [[ "${LIC_APP_USED}" == "N/A" || "${LIC_APP_USED}" == "null" || -z "${LIC_APP_USED}" ]]; then
-        LIC_APP_USED="${TOTAL_APPS}"
-    fi
-    LIC_APP_LICENSED="Unlimited"
 
-    # ── Calculate days remaining ──
+    # Days remaining
     if [[ "${LIC_EXPIRES}" != "N/A" && "${LIC_EXPIRES}" != "null" && -n "${LIC_EXPIRES}" ]]; then
         local exp_epoch now_epoch
         exp_epoch=$(portable_date_epoch "${LIC_EXPIRES}")
@@ -520,26 +570,20 @@ get_license_info() {
         fi
     fi
 
-    # ── Format dates nicely ──
     if [[ "${LIC_ISSUED}" != "N/A" && "${LIC_ISSUED}" != "null" && -n "${LIC_ISSUED}" ]]; then
         LIC_ISSUED=$(portable_date_fmt "${LIC_ISSUED}" "%b %d, %Y")
     fi
 
-    # ── Consumption percentages ──
+    # Node consumption %
     if [[ "${LIC_NODE_LICENSED}" =~ ^[0-9]+$ && "${LIC_NODE_USED}" =~ ^[0-9]+$ ]]; then
         if [[ "${LIC_NODE_LICENSED}" -gt 0 ]]; then
             LIC_NODE_PCT=$(( LIC_NODE_USED * 100 / LIC_NODE_LICENSED ))
         fi
     fi
-    if [[ "${LIC_APP_LICENSED}" =~ ^[0-9]+$ && "${LIC_APP_USED}" =~ ^[0-9]+$ ]]; then
-        if [[ "${LIC_APP_LICENSED}" -gt 0 ]]; then
-            LIC_APP_PCT=$(( LIC_APP_USED * 100 / LIC_APP_LICENSED ))
-        fi
-    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  COLLECT ALL DATA
+#  COLLECT
 # ═══════════════════════════════════════════════════════════════════════════════
 log "Gathering Kasten version..."
 KASTEN_VERSION=$(get_kasten_version)
@@ -549,18 +593,22 @@ log "Gathering application data..."
 get_applications
 log "  → ${TOTAL_APPS} apps (${COMPLIANT_APPS} compliant, ${NONCOMPLIANT_APPS} non-compliant, ${UNMANAGED_APPS} unmanaged)"
 
+log "Loading runactions (single fetch, reused)..."
+load_runactions
+log "  → $(echo "${RUNACTIONS_JSON}" | jq '.items | length') runactions loaded"
+
 log "Gathering policy data..."
 get_policies
 log "  → ${TOTAL_POLICIES} policies (${#POLICY_NAMES[@]} enumerated)"
 
-log "Gathering report/action data..."
+log "Computing daily action counts..."
 get_report_actions
 
 log "Gathering storage info..."
 get_storage_info
 log "  → Backup data: ${TOTAL_BACKUP_DATA} | Snapshot: ${SNAPSHOT_SIZE} | Object: ${OBJECT_STORAGE}"
 
-# ── Enrich from K10 report (authoritative compliance & version) ──
+# Enrich from K10 report when available
 if [[ -n "${REPORT_COMPLIANCE_APPS}" ]]; then
     TOTAL_APPS="${REPORT_COMPLIANCE_APPS}"
     COMPLIANT_APPS="${REPORT_COMPLIANCE_COMPLIANT:-0}"
@@ -581,49 +629,51 @@ log "Gathering license & consumption data..."
 get_license_info
 log "  → License: ${LIC_CUSTOMER} | ${LIC_TYPE} | Status: ${LIC_STATUS} | Expires: ${LIC_EXPIRES} | Nodes: ${LIC_NODE_USED}/${LIC_NODE_LICENSED}"
 
+# Count failed policies (used by alert banner)
+FAILED_POLICY_COUNT=0
+for s in "${POLICY_STATUSES[@]:-}"; do
+    if [[ "${s}" == "Failed" ]]; then
+        FAILED_POLICY_COUNT=$(( FAILED_POLICY_COUNT + 1 ))
+    fi
+done
+
 log "Data collection complete. Building reports..."
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GENERATE JSON REPORT
+#  JSON REPORT
 # ═══════════════════════════════════════════════════════════════════════════════
-JSON_FILE="${REPORT_DIR}/kasten-report-${TODAY}.json"
-
 generate_json() {
-    # Build policy array safely via jq (handles special chars)
     local policy_array="[]"
     if [[ ${#POLICY_NAMES[@]} -gt 0 ]]; then
-        policy_array="[]"
         for i in "${!POLICY_NAMES[@]}"; do
             policy_array=$(echo "${policy_array}" | jq \
-                --arg name "${POLICY_NAMES[$i]}" \
-                --arg type "${POLICY_TYPES[$i]}" \
+                --arg name    "${POLICY_NAMES[$i]}" \
+                --arg type    "${POLICY_TYPES[$i]}" \
                 --arg lastRun "${POLICY_LAST_RUN[$i]}" \
-                --arg status "${POLICY_STATUSES[$i]}" \
+                --arg status  "${POLICY_STATUSES[$i]}" \
                 --arg details "${POLICY_DETAILS[$i]}" \
                 '. + [{"name":$name,"type":$type,"lastRun":$lastRun,"status":$status,"details":$details}]')
         done
     fi
 
-    # Build service array safely via jq
     local service_array="[]"
     if [[ ${#SERVICE_NAMES[@]} -gt 0 ]]; then
-        service_array="[]"
         for i in "${!SERVICE_NAMES[@]}"; do
             service_array=$(echo "${service_array}" | jq \
-                --arg name "${SERVICE_NAMES[$i]}" \
+                --arg name     "${SERVICE_NAMES[$i]}" \
                 --arg replicas "${SERVICE_REPLICAS[$i]}" \
-                --arg status "${SERVICE_STATUSES[$i]}" \
+                --arg status   "${SERVICE_STATUSES[$i]}" \
                 '. + [{"name":$name,"replicas":$replicas,"status":$status}]')
         done
     fi
 
-    # Assemble full JSON — all values via --arg so jq escapes everything
     jq -n \
         --arg date "${TODAY}" \
         --arg time "${TIME_NOW}" \
         --arg cluster "${CLUSTER_NAME}" \
         --arg instance "${INSTANCE_ID}" \
         --arg version "${KASTEN_VERSION}" \
+        --arg is_openshift "${IS_OPENSHIFT}" \
         --arg total_apps "${TOTAL_APPS}" \
         --arg compliant "${COMPLIANT_APPS}" \
         --arg noncompliant "${NONCOMPLIANT_APPS}" \
@@ -632,6 +682,7 @@ generate_json() {
         --arg backup_policies "${BACKUP_POLICIES}" \
         --arg import_policies "${IMPORT_POLICIES}" \
         --arg system_policies "${SYSTEM_POLICIES}" \
+        --arg failed_policies "${FAILED_POLICY_COUNT}" \
         --arg backup_data "${TOTAL_BACKUP_DATA}" \
         --arg snapshot_size "${SNAPSHOT_SIZE}" \
         --arg object_storage "${OBJECT_STORAGE}" \
@@ -646,9 +697,6 @@ generate_json() {
         --arg lic_node_licensed "${LIC_NODE_LICENSED}" \
         --arg lic_node_used "${LIC_NODE_USED}" \
         --arg lic_node_pct "${LIC_NODE_PCT}" \
-        --arg lic_app_licensed "${LIC_APP_LICENSED}" \
-        --arg lic_app_used "${LIC_APP_USED}" \
-        --arg lic_app_pct "${LIC_APP_PCT}" \
         --arg lic_features "${LIC_FEATURES}" \
         --arg all_healthy "${ALL_HEALTHY}" \
         --argjson policies "${policy_array}" \
@@ -659,7 +707,8 @@ generate_json() {
             "cluster": {
                 "name": $cluster,
                 "instanceId": $instance,
-                "kastenVersion": $version
+                "kastenVersion": $version,
+                "isOpenShift": ($is_openshift == "true")
             },
             "applications": {
                 "total": ($total_apps | tonumber),
@@ -672,6 +721,7 @@ generate_json() {
                 "backup": ($backup_policies | tonumber),
                 "import": ($import_policies | tonumber),
                 "system": ($system_policies | tonumber),
+                "failed": ($failed_policies | tonumber),
                 "details": $policies
             },
             "storage": {
@@ -694,11 +744,6 @@ generate_json() {
                         "used": ($lic_node_used | tonumber? // $lic_node_used),
                         "licensed": ($lic_node_licensed | tonumber? // $lic_node_licensed),
                         "percent": ($lic_node_pct | tonumber)
-                    },
-                    "applications": {
-                        "used": ($lic_app_used | tonumber? // $lic_app_used),
-                        "licensed": ($lic_app_licensed | tonumber? // $lic_app_licensed),
-                        "percent": ($lic_app_pct | tonumber)
                     }
                 }
             },
@@ -719,10 +764,21 @@ generate_json() {
 generate_json
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BUILD HTML REPORT
+#  HTML REPORT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Policy rows
+# Pre-escape values that will be injected verbatim into HTML
+H_CLUSTER_NAME=$(html_escape "${CLUSTER_NAME}")
+H_INSTANCE_ID=$(html_escape "${INSTANCE_ID}")
+H_KASTEN_VERSION=$(html_escape "${KASTEN_VERSION}")
+H_LIC_CUSTOMER=$(html_escape "${LIC_CUSTOMER}")
+H_LIC_TYPE=$(html_escape "${LIC_TYPE}")
+H_LIC_ID=$(html_escape "${LIC_ID}")
+H_LIC_ISSUED=$(html_escape "${LIC_ISSUED}")
+H_LIC_EXPIRES=$(html_escape "${LIC_EXPIRES}")
+H_LIC_FEATURES=$(html_escape "${LIC_FEATURES}")
+
+# Policy rows (escape every cluster-derived value)
 POLICY_TABLE_ROWS=""
 POLICY_ERROR_ROWS=""
 for i in "${!POLICY_NAMES[@]}"; do
@@ -734,22 +790,29 @@ for i in "${!POLICY_NAMES[@]}"; do
     esac
     row_bg=""
     if [[ $((i % 2)) -eq 1 ]]; then row_bg=' style="background-color:#F7F9FC;"'; fi
+
+    pname_h=$(html_escape   "${POLICY_NAMES[$i]}")
+    ptype_h=$(html_escape   "${POLICY_TYPES[$i]}")
+    plast_h=$(html_escape   "${POLICY_LAST_RUN[$i]}")
+    pstat_h=$(html_escape   "${POLICY_STATUSES[$i]}")
+    pdet_h=$(html_escape    "${POLICY_DETAILS[$i]}")
+
     POLICY_TABLE_ROWS+="
     <tr${row_bg}>
-        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${POLICY_NAMES[$i]}</td>
-        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${POLICY_TYPES[$i]}</td>
-        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${POLICY_LAST_RUN[$i]}</td>
-        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;color:${status_color};font-weight:700;'>${status_icon} ${POLICY_STATUSES[$i]}</td>
-        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;'>${POLICY_DETAILS[$i]}</td>
+        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${pname_h}</td>
+        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${ptype_h}</td>
+        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${plast_h}</td>
+        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;color:${status_color};font-weight:700;'>${status_icon} ${pstat_h}</td>
+        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;'>${pdet_h}</td>
     </tr>"
     if [[ "${POLICY_STATUSES[$i]}" == "Failed" ]]; then
         POLICY_ERROR_ROWS+="
-        <tr><td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${POLICY_NAMES[$i]}</td>
-        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;color:#E74C3C;'>${POLICY_DETAILS[$i]}</td></tr>"
+        <tr><td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${pname_h}</td>
+        <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;color:#E74C3C;'>${pdet_h}</td></tr>"
     fi
 done
 
-# Service rows
+# Service rows (escape names)
 SERVICE_TABLE_ROWS=""
 for i in "${!SERVICE_NAMES[@]}"; do
     svc_color="#27AE60"; svc_icon="&#10003;"
@@ -758,31 +821,49 @@ for i in "${!SERVICE_NAMES[@]}"; do
     fi
     row_bg=""
     if [[ $((i % 2)) -eq 1 ]]; then row_bg=' style="background-color:#F7F9FC;"'; fi
+
+    sname_h=$(html_escape "${SERVICE_NAMES[$i]}")
+    srep_h=$(html_escape  "${SERVICE_REPLICAS[$i]}")
+    sstat_h=$(html_escape "${SERVICE_STATUSES[$i]}")
+
     SERVICE_TABLE_ROWS+="
     <tr${row_bg}>
-        <td style='padding:8px 14px;border-bottom:1px solid #E8E8E8;'>${SERVICE_NAMES[$i]}</td>
-        <td style='padding:8px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${SERVICE_REPLICAS[$i]}</td>
-        <td style='padding:8px 14px;border-bottom:1px solid #E8E8E8;text-align:center;color:${svc_color};font-weight:700;'>${svc_icon} ${SERVICE_STATUSES[$i]}</td>
+        <td style='padding:8px 14px;border-bottom:1px solid #E8E8E8;'>${sname_h}</td>
+        <td style='padding:8px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${srep_h}</td>
+        <td style='padding:8px 14px;border-bottom:1px solid #E8E8E8;text-align:center;color:${svc_color};font-weight:700;'>${svc_icon} ${sstat_h}</td>
     </tr>"
 done
 
-# Health banner
+# Top-of-report alert banner (non-compliance + failed policies)
+ALERT_BANNER=""
+if [[ "${NONCOMPLIANT_APPS}" -gt 0 || "${FAILED_POLICY_COUNT}" -gt 0 ]]; then
+    alert_parts=""
+    if [[ "${NONCOMPLIANT_APPS}" -gt 0 ]]; then
+        alert_parts="${NONCOMPLIANT_APPS} non-compliant application(s)"
+    fi
+    if [[ "${FAILED_POLICY_COUNT}" -gt 0 ]]; then
+        if [[ -n "${alert_parts}" ]]; then alert_parts="${alert_parts} &bull; "; fi
+        alert_parts="${alert_parts}${FAILED_POLICY_COUNT} failed polic$(if [[ ${FAILED_POLICY_COUNT} -eq 1 ]]; then echo y; else echo ies; fi)"
+    fi
+    ALERT_BANNER="<div style='background:#E74C3C;color:#fff;padding:12px 20px;border-radius:6px;font-weight:700;font-size:15px;margin-bottom:16px;'>&#9888; Action required &mdash; ${alert_parts}</div>"
+fi
+
+# Service health banner
 if ${ALL_HEALTHY}; then
     HEALTH_BANNER="<div style='background:#27AE60;color:#fff;padding:12px 20px;border-radius:6px;font-weight:700;font-size:15px;margin-bottom:16px;'>&#10003; All services are operational</div>"
 else
     HEALTH_BANNER="<div style='background:#E74C3C;color:#fff;padding:12px 20px;border-radius:6px;font-weight:700;font-size:15px;margin-bottom:16px;'>&#10007; Some services are degraded</div>"
 fi
 
-# Compliance color
 NONCOMPLIANT_COLOR="#27AE60"
 if [[ "${NONCOMPLIANT_APPS}" -gt 0 ]]; then NONCOMPLIANT_COLOR="#E74C3C"; fi
 
 # License banner
-LIC_BANNER_BG="${LIC_STATUS_COLOR}"; LIC_BANNER_ICON="&#10003;"; LIC_BANNER_TEXT="License valid — ${LIC_DAYS_LEFT} days remaining"
+LIC_BANNER_BG="${LIC_STATUS_COLOR}"; LIC_BANNER_ICON="&#10003;"; LIC_BANNER_TEXT="License valid &mdash; ${LIC_DAYS_LEFT} days remaining"
 case "${LIC_STATUS}" in
-    EXPIRED)         LIC_BANNER_ICON="&#10007;"; LIC_BANNER_TEXT="LICENSE EXPIRED — Renew immediately" ;;
-    "Expiring Soon") LIC_BANNER_ICON="&#9888;";  LIC_BANNER_TEXT="License expiring in ${LIC_DAYS_LEFT} days — Action required" ;;
-    Attention)       LIC_BANNER_ICON="&#9888;";  LIC_BANNER_TEXT="License expires in ${LIC_DAYS_LEFT} days — Plan renewal" ;;
+    EXPIRED)         LIC_BANNER_ICON="&#10007;"; LIC_BANNER_TEXT="LICENSE EXPIRED &mdash; Renew immediately" ;;
+    "Expiring Soon") LIC_BANNER_ICON="&#9888;";  LIC_BANNER_TEXT="License expiring in ${LIC_DAYS_LEFT} days &mdash; Action required" ;;
+    Attention)       LIC_BANNER_ICON="&#9888;";  LIC_BANNER_TEXT="License expires in ${LIC_DAYS_LEFT} days &mdash; Plan renewal" ;;
     Unknown)         LIC_BANNER_ICON="&#8212;";  LIC_BANNER_TEXT="License status could not be determined"; LIC_BANNER_BG="#999999" ;;
 esac
 LICENSE_BANNER="<div style='background:${LIC_BANNER_BG};color:#fff;padding:12px 20px;border-radius:6px;font-weight:700;font-size:14px;margin-bottom:16px;'>${LIC_BANNER_ICON} ${LIC_BANNER_TEXT}</div>"
@@ -814,10 +895,14 @@ fi
 
 FEATURES_LINE="Feature details not available"
 if [[ -n "${LIC_FEATURES}" && "${LIC_FEATURES}" != "null" ]]; then
-    FEATURES_LINE="Features: <span style='color:#666;'>${LIC_FEATURES}</span>"
+    FEATURES_LINE="Features: <span style='color:#666;'>${H_LIC_FEATURES}</span>"
 fi
 
-# ─── Write HTML ───────────────────────────────────────────────────────────────
+OCP_BADGE=""
+if ${IS_OPENSHIFT}; then
+    OCP_BADGE=" &bull; <span style='background:rgba(255,255,255,0.15);padding:2px 8px;border-radius:10px;font-size:11px;'>OpenShift</span>"
+fi
+
 cat > "${REPORT_FILE}" <<HTMLEOF
 <!DOCTYPE html>
 <html>
@@ -827,11 +912,13 @@ cat > "${REPORT_FILE}" <<HTMLEOF
 
 <div style="background:linear-gradient(135deg,#1B2A4A,#2E75B6);padding:30px 32px;">
     <h1 style="margin:0 0 4px;color:#fff;font-size:24px;">&#9749; Morning Coffee Report</h1>
-    <p style="margin:0;color:rgba(255,255,255,0.75);font-size:13px;">${TODAY_PRETTY} &nbsp;|&nbsp; ${TIME_NOW} &nbsp;|&nbsp; Kasten ${KASTEN_VERSION}</p>
-    <p style="margin:8px 0 0;color:rgba(255,255,255,0.6);font-size:12px;">Cluster: <strong style="color:#fff;">${CLUSTER_NAME}</strong> &nbsp;&bull;&nbsp; Instance: <strong style="color:#fff;">${INSTANCE_ID}</strong></p>
+    <p style="margin:0;color:rgba(255,255,255,0.75);font-size:13px;">${TODAY_PRETTY} &nbsp;|&nbsp; ${TIME_NOW} &nbsp;|&nbsp; Kasten ${H_KASTEN_VERSION}${OCP_BADGE}</p>
+    <p style="margin:8px 0 0;color:rgba(255,255,255,0.6);font-size:12px;">Cluster: <strong style="color:#fff;">${H_CLUSTER_NAME}</strong> &nbsp;&bull;&nbsp; Instance: <strong style="color:#fff;">${H_INSTANCE_ID}</strong></p>
 </div>
 
 <div style="padding:24px 32px;">
+
+${ALERT_BANNER}
 
 <h2 style="margin:0 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">1. Cluster Overview</h2>
 <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:8px;"><tr>
@@ -843,7 +930,7 @@ cat > "${REPORT_FILE}" <<HTMLEOF
 <h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">2. License &amp; Consumption</h2>
 ${LICENSE_BANNER}
 <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;"><tr>
-    <td style="width:50%;padding:0 8px 0 0;vertical-align:top;"><div style="background:#F7F9FC;border-radius:6px;padding:16px;border:1px solid #E8E8E8;"><div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:10px;">License Details</div><table cellpadding="0" cellspacing="0" style="font-size:12px;width:100%;"><tr><td style="padding:3px 0;color:#888;width:90px;">Customer</td><td style="padding:3px 0;font-weight:600;">${LIC_CUSTOMER}</td></tr><tr><td style="padding:3px 0;color:#888;">Product</td><td style="padding:3px 0;font-weight:600;">${LIC_TYPE}</td></tr><tr><td style="padding:3px 0;color:#888;">License ID</td><td style="padding:3px 0;font-weight:600;font-size:10px;word-break:break-all;">${LIC_ID}</td></tr><tr><td style="padding:3px 0;color:#888;">Issued</td><td style="padding:3px 0;">${LIC_ISSUED}</td></tr><tr><td style="padding:3px 0;color:#888;">Expires</td><td style="padding:3px 0;font-weight:700;color:${LIC_STATUS_COLOR};">${LIC_EXPIRES}</td></tr><tr><td style="padding:3px 0;color:#888;">Days Left</td><td style="padding:3px 0;font-weight:700;color:${LIC_STATUS_COLOR};">${LIC_DAYS_LEFT}</td></tr></table></div></td>
+    <td style="width:50%;padding:0 8px 0 0;vertical-align:top;"><div style="background:#F7F9FC;border-radius:6px;padding:16px;border:1px solid #E8E8E8;"><div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:10px;">License Details</div><table cellpadding="0" cellspacing="0" style="font-size:12px;width:100%;"><tr><td style="padding:3px 0;color:#888;width:90px;">Customer</td><td style="padding:3px 0;font-weight:600;">${H_LIC_CUSTOMER}</td></tr><tr><td style="padding:3px 0;color:#888;">Product</td><td style="padding:3px 0;font-weight:600;">${H_LIC_TYPE}</td></tr><tr><td style="padding:3px 0;color:#888;">License ID</td><td style="padding:3px 0;font-weight:600;font-size:10px;word-break:break-all;">${H_LIC_ID}</td></tr><tr><td style="padding:3px 0;color:#888;">Issued</td><td style="padding:3px 0;">${H_LIC_ISSUED}</td></tr><tr><td style="padding:3px 0;color:#888;">Expires</td><td style="padding:3px 0;font-weight:700;color:${LIC_STATUS_COLOR};">${H_LIC_EXPIRES}</td></tr><tr><td style="padding:3px 0;color:#888;">Days Left</td><td style="padding:3px 0;font-weight:700;color:${LIC_STATUS_COLOR};">${LIC_DAYS_LEFT}</td></tr></table></div></td>
     <td style="width:50%;padding:0 0 0 8px;vertical-align:top;"><div style="background:#F7F9FC;border-radius:6px;padding:16px;border:1px solid #E8E8E8;"><div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:10px;">Consumption</div>${NODE_BAR}<div style="font-size:11px;color:#AAA;margin-top:8px;border-top:1px solid #E8E8E8;padding-top:8px;">${FEATURES_LINE}</div></div></td>
 </tr></table>
 
@@ -870,12 +957,24 @@ ${HEALTH_BANNER}
 <tbody>${SERVICE_TABLE_ROWS}</tbody></table>
 
 <div style="margin-top:32px;padding-top:16px;border-top:1px solid #E8E8E8;font-size:11px;color:#AAA;text-align:center;">
-    Generated on ${TODAY_PRETTY} at ${TIME_NOW} &bull; Kasten K10 ${KASTEN_VERSION} &bull; ${CLUSTER_NAME}
+    Generated on ${TODAY_PRETTY} at ${TIME_NOW} &bull; Kasten K10 ${H_KASTEN_VERSION} &bull; ${H_CLUSTER_NAME}
 </div>
 </div></div></body></html>
 HTMLEOF
 
 log "HTML report saved to: ${REPORT_FILE}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RETENTION CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "${RETENTION_DAYS}" =~ ^[0-9]+$ && "${RETENTION_DAYS}" -gt 0 ]]; then
+    deleted=$(find "${REPORT_DIR}" -maxdepth 1 -type f \
+        \( -name 'kasten-report-*.html' -o -name 'kasten-report-*.json' \) \
+        -mtime +${RETENTION_DAYS} -print -delete 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${deleted}" -gt 0 ]]; then
+        log "Retention: deleted ${deleted} report file(s) older than ${RETENTION_DAYS} days"
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  EMAIL DELIVERY
@@ -893,53 +992,76 @@ send_email() {
     log "  → HTML body + JSON attachment: $(basename "${JSON_FILE}")"
     case "${MAIL_METHOD}" in
         smtp)
-            python3 - <<PYEOF
-import smtplib, sys, os
+            # Export everything Python needs; use a QUOTED heredoc so bash
+            # does not expand $() or ${} inside the Python code (avoids
+            # shell injection through SMTP_PASS, MAIL_SUBJECT, etc.).
+            export _K_REPORT_FILE="${REPORT_FILE}"
+            export _K_JSON_FILE="${JSON_FILE}"
+            export _K_MAIL_SUBJECT="${MAIL_SUBJECT}"
+            export _K_MAIL_FROM="${MAIL_FROM}"
+            export _K_MAIL_TO="${MAIL_TO}"
+            export _K_SMTP_SERVER="${SMTP_SERVER}"
+            export _K_SMTP_PORT="${SMTP_PORT}"
+            export _K_SMTP_USER="${SMTP_USER}"
+            export _K_SMTP_PASS="${SMTP_PASS}"
+            export _K_SMTP_TLS="${SMTP_TLS}"
+
+            python3 - <<'PYEOF'
+import os, smtplib, sys
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 
-with open("${REPORT_FILE}", "r") as f:
+report_file  = os.environ["_K_REPORT_FILE"]
+json_file    = os.environ["_K_JSON_FILE"]
+mail_subject = os.environ["_K_MAIL_SUBJECT"]
+mail_from    = os.environ["_K_MAIL_FROM"]
+mail_to      = os.environ["_K_MAIL_TO"]
+smtp_server  = os.environ["_K_SMTP_SERVER"]
+smtp_port    = int(os.environ.get("_K_SMTP_PORT", "25"))
+smtp_user    = os.environ.get("_K_SMTP_USER", "")
+smtp_pass    = os.environ.get("_K_SMTP_PASS", "")
+smtp_tls     = os.environ.get("_K_SMTP_TLS", "false").lower() == "true"
+
+with open(report_file, "r", encoding="utf-8") as f:
     html_body = f.read()
 
-# Mixed = allows both alternative body AND attachments
 msg = MIMEMultipart("mixed")
-msg["Subject"] = """${MAIL_SUBJECT}"""
-msg["From"]    = "${MAIL_FROM}"
-msg["To"]      = "${MAIL_TO}"
+msg["Subject"] = mail_subject
+msg["From"]    = mail_from
+msg["To"]      = mail_to
 
-# HTML body as alternative (plain + html)
 body_part = MIMEMultipart("alternative")
 body_part.attach(MIMEText("Kasten Morning Coffee Report. View in an HTML-capable client.", "plain"))
 body_part.attach(MIMEText(html_body, "html"))
 msg.attach(body_part)
 
-# JSON attachment
-json_path = "${JSON_FILE}"
-if os.path.exists(json_path):
-    with open(json_path, "r") as jf:
+if os.path.exists(json_file):
+    with open(json_file, "r", encoding="utf-8") as jf:
         json_attachment = MIMEApplication(jf.read().encode("utf-8"), _subtype="json")
         json_attachment.add_header("Content-Disposition", "attachment",
-                                   filename=os.path.basename(json_path))
+                                   filename=os.path.basename(json_file))
         msg.attach(json_attachment)
-    print(f"JSON attached: {os.path.basename(json_path)}")
+    print(f"JSON attached: {os.path.basename(json_file)}")
 
 try:
-    server = smtplib.SMTP("${SMTP_SERVER}", ${SMTP_PORT}, timeout=30)
+    server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
     server.ehlo()
-    if "${SMTP_TLS}" == "true":
+    if smtp_tls:
         server.starttls(); server.ehlo()
-    if "${SMTP_USER}":
-        server.login("${SMTP_USER}", "${SMTP_PASS}")
-    server.sendmail("${MAIL_FROM}", "${MAIL_TO}".split(","), msg.as_string())
+    if smtp_user:
+        server.login(smtp_user, smtp_pass)
+    server.sendmail(mail_from, [r.strip() for r in mail_to.split(",") if r.strip()], msg.as_string())
     server.quit()
     print("Email sent successfully.")
 except Exception as e:
     print(f"ERROR sending email: {e}", file=sys.stderr); sys.exit(1)
 PYEOF
+            # Clean up exported vars (best-effort)
+            unset _K_REPORT_FILE _K_JSON_FILE _K_MAIL_SUBJECT _K_MAIL_FROM _K_MAIL_TO \
+                  _K_SMTP_SERVER _K_SMTP_PORT _K_SMTP_USER _K_SMTP_PASS _K_SMTP_TLS
             ;;
         sendmail)
-            # sendmail with multipart/mixed for attachment
             local boundary="kasten-report-$$-$(date +%s)"
             {
                 echo "From: ${MAIL_FROM}"
@@ -963,7 +1085,6 @@ PYEOF
                 echo "--${boundary}--"
             } | sendmail -t ;;
         mailx)
-            # mailx with attachment flag
             if command -v mutt >/dev/null 2>&1; then
                 echo "Kasten Morning Report" | mutt -e "set content_type=text/html" \
                     -s "${MAIL_SUBJECT}" -a "${JSON_FILE}" -- "${MAIL_TO}" < "${REPORT_FILE}"
