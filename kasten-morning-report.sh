@@ -359,9 +359,21 @@ render_action_cell() {
     printf '%s' "${parts}"
 }
 
+# v3.1 fix (bug #2): countStats has 8 keys in K10 8.5.x (backup, backupCluster,
+# export, import, report, restore, restoreCluster, run) — the previous 5-key
+# hardcoded set silently dropped backupCluster/restoreCluster/report failures.
+# This version iterates dynamically (forward-compatible) and groups results
+# into 4 business categories + Run separately (excluded from total errors).
+#   Backup  = backup + backupCluster
+#   Restore = restore + restoreCluster
+#   Export  = export
+#   Autres  = import + report (+ any unknown future key)
+#   Run     = run (separate row, NOT counted in total errors)
 get_daily_action_stats() {
     REPORT_ROWS=""
-    # Pick last 3 scheduled reports (most recent first)
+    DAILY_FAILED_TOTAL=0
+    DAILY_STATS_JSON="[]"
+
     local reports_subset count
     reports_subset=$(echo "${REPORTS_JSON}" | jq '
         [.items[] | select(.metadata.generateName? | tostring | startswith("scheduled-"))]
@@ -370,24 +382,60 @@ get_daily_action_stats() {
     count=$(echo "${reports_subset}" | jq 'length')
 
     if [[ "${count}" -eq 0 ]]; then
-        REPORT_ROWS="<tr><td colspan='5' style='padding:12px;text-align:center;color:#888;font-style:italic;'>No scheduled K10 reports found</td></tr>"
+        REPORT_ROWS="<tr><td colspan='6' style='padding:12px;text-align:center;color:#888;font-style:italic;'>No scheduled K10 reports found</td></tr>"
         return
     fi
 
+    # Build grouped stats in a single jq pass — covers any new key K10 might add.
+    DAILY_STATS_JSON=$(echo "${reports_subset}" | jq '
+        def group_of(k):
+            if   k == "backup"  or k == "backupCluster"  then "Backup"
+            elif k == "restore" or k == "restoreCluster" then "Restore"
+            elif k == "export"                           then "Export"
+            elif k == "run"                              then "Run"
+            else                                              "Autres"
+            end;
+        def zero: {completed:0, failed:0, skipped:0, cancelled:0};
+        [ .[] |
+          (.results.actions.countStats // {}) as $cs |
+          {
+            date: (.spec.statsIntervalEndTimestamp // .spec.reportTimestamp // .metadata.creationTimestamp),
+            grouped: (
+              reduce ($cs | to_entries[]) as $e (
+                { "Backup": zero, "Restore": zero, "Export": zero, "Autres": zero, "Run": zero };
+                .[group_of($e.key)] |= {
+                  completed: (.completed + ($e.value.completed // 0)),
+                  failed:    (.failed    + ($e.value.failed    // 0)),
+                  skipped:   (.skipped   + ($e.value.skipped   // 0)),
+                  cancelled: (.cancelled + ($e.value.cancelled // 0))
+                }
+              )
+            ),
+            raw: $cs
+          }
+        ]
+    ' 2>/dev/null || echo '[]')
+
+    # Aggregated failed count for top alert banner — Run EXCLUDED to avoid
+    # double-counting (a RunAction wraps backup/export sub-actions already counted).
+    DAILY_FAILED_TOTAL=$(echo "${DAILY_STATS_JSON}" | jq '
+        [ .[].grouped | (.Backup.failed + .Restore.failed + .Export.failed + .Autres.failed) ]
+        | add // 0
+    ')
+
     local i
     for i in $(seq 0 $((count - 1))); do
-        local report row_bg report_date date_label
-        report=$(echo "${reports_subset}" | jq ".[${i}]")
-        report_date=$(echo "${report}" | jq -r '.spec.statsIntervalEndTimestamp // .spec.reportTimestamp // .metadata.creationTimestamp // ""')
+        local row report_date date_label row_bg
+        row=$(echo "${DAILY_STATS_JSON}" | jq ".[${i}]")
+        report_date=$(echo "${row}" | jq -r '.date // ""')
         date_label=$(portable_date_fmt "${report_date}" "%b %d")
 
-        # Extract per-action-type stats in a single jq invocation each.
-        # Format: "completed failed skipped cancelled"
-        local backup_stats export_stats import_stats run_stats
-        backup_stats=$(echo "${report}" | jq -r '.results.actions.countStats.backup | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
-        export_stats=$(echo "${report}" | jq -r '.results.actions.countStats.export | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
-        import_stats=$(echo "${report}" | jq -r '.results.actions.countStats.import | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
-        run_stats=$(echo    "${report}" | jq -r '.results.actions.countStats.run    | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
+        local backup_stats restore_stats export_stats autres_stats run_stats
+        backup_stats=$( echo "${row}" | jq -r '.grouped.Backup  | "\(.completed) \(.failed) \(.skipped) \(.cancelled)"')
+        restore_stats=$(echo "${row}" | jq -r '.grouped.Restore | "\(.completed) \(.failed) \(.skipped) \(.cancelled)"')
+        export_stats=$( echo "${row}" | jq -r '.grouped.Export  | "\(.completed) \(.failed) \(.skipped) \(.cancelled)"')
+        autres_stats=$( echo "${row}" | jq -r '.grouped.Autres  | "\(.completed) \(.failed) \(.skipped) \(.cancelled)"')
+        run_stats=$(    echo "${row}" | jq -r '.grouped.Run     | "\(.completed) \(.failed) \(.skipped) \(.cancelled)"')
 
         row_bg=""
         if [[ $((i % 2)) -eq 1 ]]; then row_bg=' style="background-color:#F7F9FC;"'; fi
@@ -396,9 +444,10 @@ get_daily_action_stats() {
         <tr${row_bg}>
             <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${date_label}</td>
             <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${backup_stats}")</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${restore_stats}")</td>
             <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${export_stats}")</td>
-            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${import_stats}")</td>
-            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${run_stats}")</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${autres_stats}")</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;color:#888;'>$(render_action_cell "${run_stats}")</td>
         </tr>"
     done
 }
@@ -861,19 +910,39 @@ generate_json() {
         done
     fi
 
-    # Build dailyStats array from the last 3 scheduled K10 reports
+    # Build dailyStats array from the last 3 scheduled K10 reports.
+    # v3.1: ventilation B (Backup/Restore/Export/Autres + Run separated) +
+    # raw countStats kept for forward compatibility and debugging.
     local daily_stats_array
     daily_stats_array=$(echo "${REPORTS_JSON}" | jq '
+        def group_of(k):
+            if   k == "backup"  or k == "backupCluster"  then "Backup"
+            elif k == "restore" or k == "restoreCluster" then "Restore"
+            elif k == "export"                           then "Export"
+            elif k == "run"                              then "Run"
+            else                                              "Autres"
+            end;
+        def zero: {completed:0, failed:0, skipped:0, cancelled:0};
         [.items[] | select(.metadata.generateName? | tostring | startswith("scheduled-"))]
         | sort_by(.metadata.creationTimestamp) | reverse | .[0:3]
-        | map({
-            date: (.spec.statsIntervalEndTimestamp // .spec.reportTimestamp // .metadata.creationTimestamp),
-            backup:  (.results.actions.countStats.backup  // {}),
-            export:  (.results.actions.countStats.export  // {}),
-            import:  (.results.actions.countStats.import  // {}),
-            restore: (.results.actions.countStats.restore // {}),
-            run:     (.results.actions.countStats.run     // {})
-          })
+        | map(
+            (.results.actions.countStats // {}) as $cs |
+            {
+              date: (.spec.statsIntervalEndTimestamp // .spec.reportTimestamp // .metadata.creationTimestamp),
+              grouped: (
+                reduce ($cs | to_entries[]) as $e (
+                  { "Backup":zero, "Restore":zero, "Export":zero, "Autres":zero, "Run":zero };
+                  .[group_of($e.key)] |= {
+                    completed: (.completed + ($e.value.completed // 0)),
+                    failed:    (.failed    + ($e.value.failed    // 0)),
+                    skipped:   (.skipped   + ($e.value.skipped   // 0)),
+                    cancelled: (.cancelled + ($e.value.cancelled // 0))
+                  }
+                )
+              ),
+              raw: $cs
+            }
+          )
     ' 2>/dev/null || echo '[]')
 
     # Build failedExports array (top 5)
@@ -1072,9 +1141,12 @@ for i in "${!SERVICE_NAMES[@]}"; do
     </tr>"
 done
 
-# Top-of-report alert banner (non-compliance + failed policies)
+# Top-of-report alert banner (non-compliance + failed policies + failed actions)
+# v3.1: DAILY_FAILED_TOTAL aggregates failed counts across Backup/Restore/Export/
+# Autres groups in the last 3 K10 reports (Run excluded — see get_daily_action_stats).
 ALERT_BANNER=""
-if [[ "${NONCOMPLIANT_APPS}" -gt 0 || "${FAILED_POLICY_COUNT}" -gt 0 ]]; then
+DAILY_FAILED_TOTAL="${DAILY_FAILED_TOTAL:-0}"
+if [[ "${NONCOMPLIANT_APPS}" -gt 0 || "${FAILED_POLICY_COUNT}" -gt 0 || "${DAILY_FAILED_TOTAL}" -gt 0 ]]; then
     alert_parts=""
     if [[ "${NONCOMPLIANT_APPS}" -gt 0 ]]; then
         alert_parts="${NONCOMPLIANT_APPS} non-compliant application(s)"
@@ -1082,6 +1154,10 @@ if [[ "${NONCOMPLIANT_APPS}" -gt 0 || "${FAILED_POLICY_COUNT}" -gt 0 ]]; then
     if [[ "${FAILED_POLICY_COUNT}" -gt 0 ]]; then
         if [[ -n "${alert_parts}" ]]; then alert_parts="${alert_parts} &bull; "; fi
         alert_parts="${alert_parts}${FAILED_POLICY_COUNT} failed polic$(if [[ ${FAILED_POLICY_COUNT} -eq 1 ]]; then echo y; else echo ies; fi)"
+    fi
+    if [[ "${DAILY_FAILED_TOTAL}" -gt 0 ]]; then
+        if [[ -n "${alert_parts}" ]]; then alert_parts="${alert_parts} &bull; "; fi
+        alert_parts="${alert_parts}${DAILY_FAILED_TOTAL} failed action(s) in last 3 reports"
     fi
     ALERT_BANNER="<div style='background:#E74C3C;color:#fff;padding:12px 20px;border-radius:6px;font-weight:700;font-size:15px;margin-bottom:16px;'>&#9888; Action required &mdash; ${alert_parts}</div>"
 fi
@@ -1177,12 +1253,16 @@ ${LICENSE_BANNER}
 <thead><tr style="background:#1B2A4A;">
     <th style="padding:10px 14px;color:#fff;text-align:left;">Date</th>
     <th style="padding:10px 14px;color:#fff;text-align:center;">Backup</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;">Restore</th>
     <th style="padding:10px 14px;color:#fff;text-align:center;">Export</th>
-    <th style="padding:10px 14px;color:#fff;text-align:center;">Import</th>
-    <th style="padding:10px 14px;color:#fff;text-align:center;">Run</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;">Autres</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;color:#BBB;">Run</th>
 </tr></thead>
 <tbody>${REPORT_ROWS}</tbody></table>
-<p style="margin:6px 2px 0;font-size:11px;color:#888;">Legend: <span style="color:#27AE60;font-weight:600;">N&nbsp;&#10003;</span> completed &nbsp;&bull;&nbsp; <span style="color:#E74C3C;font-weight:700;">N&nbsp;&#10007;</span> failed &nbsp;&bull;&nbsp; <span style="color:#F39C12;">N&nbsp;skip</span> skipped &nbsp;&bull;&nbsp; <span style="color:#888;">N&nbsp;cnl</span> cancelled</p>
+<p style="margin:6px 2px 0;font-size:11px;color:#888;">
+    Legend: <span style="color:#27AE60;font-weight:600;">N&nbsp;&#10003;</span> completed &nbsp;&bull;&nbsp; <span style="color:#E74C3C;font-weight:700;">N&nbsp;&#10007;</span> failed &nbsp;&bull;&nbsp; <span style="color:#F39C12;">N&nbsp;skip</span> skipped &nbsp;&bull;&nbsp; <span style="color:#888;">N&nbsp;cnl</span> cancelled<br/>
+    <em>Backup</em> = backup + backupCluster &nbsp;&bull;&nbsp; <em>Restore</em> = restore + restoreCluster &nbsp;&bull;&nbsp; <em>Autres</em> = import + report &nbsp;&bull;&nbsp; <em>Run</em> = policy execution wrappers (excluded from total errors)
+</p>
 
 <h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">4. Last Policy Run Status</h2>
 <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
