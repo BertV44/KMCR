@@ -224,6 +224,34 @@ load_runactions() {
         --sort-by='.metadata.creationTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
 }
 
+# ─── K10 reports: single fetch, reused by storage + daily stats + license ─────
+REPORTS_JSON=""
+load_reports() {
+    REPORTS_JSON=$(${K} get reports.reporting.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
+        --sort-by='.metadata.creationTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
+}
+
+# ─── Export actions: single fetch for top-failed-exports table ────────────────
+EXPORTACTIONS_JSON=""
+load_exportactions() {
+    EXPORTACTIONS_JSON=$(${K} get exportactions.actions.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
+        -o json 2>/dev/null || echo '{"items":[]}')
+}
+
+# ─── Humanize a byte count to TiB/GiB/MiB/KiB/B ────────────────────────────────
+humanize_bytes() {
+    local b="${1:-0}"
+    if ! [[ "${b}" =~ ^[0-9]+$ ]] || [[ "${b}" -eq 0 ]]; then
+        echo "0 B"; return
+    fi
+    if   [[ "${b}" -ge 1099511627776 ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f TiB", n/1099511627776}'
+    elif [[ "${b}" -ge 1073741824    ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f GiB", n/1073741824}'
+    elif [[ "${b}" -ge 1048576       ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f MiB", n/1048576}'
+    elif [[ "${b}" -ge 1024          ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f KiB", n/1024}'
+    else                                      echo "${b} B"
+    fi
+}
+
 # ─── Policies ─────────────────────────────────────────────────────────────────
 get_policies() {
     local policies_json
@@ -298,48 +326,192 @@ get_policies() {
     done
 }
 
-# ─── Daily action counts (last 3 days) ────────────────────────────────────────
-get_report_actions() {
+# ─── Daily action stats (last 3 K10 scheduled reports) ───────────────────────
+# Source: results.actions.countStats from reports.reporting.kio.kasten.io
+# This is the AUTHORITATIVE source: K10 itself counts backup/export/import/
+# restore/run separately, by completed/failed/cancelled/skipped.
+
+# Render one cell of action stats. Input: "completed failed skipped cancelled"
+render_action_cell() {
+    local c f s cn
+    read -r c f s cn <<<"$1"
+    local total=$(( c + f + s + cn ))
+    if [[ "${total}" -eq 0 ]]; then
+        printf '<span style="color:#BBB;">&mdash;</span>'
+        return
+    fi
+    local parts=""
+    if [[ "${c}" -gt 0 ]]; then
+        parts="<span style='color:#27AE60;font-weight:600;'>${c}&nbsp;&#10003;</span>"
+    fi
+    if [[ "${f}" -gt 0 ]]; then
+        [[ -n "${parts}" ]] && parts="${parts}&nbsp;"
+        parts="${parts}<span style='color:#E74C3C;font-weight:700;'>${f}&nbsp;&#10007;</span>"
+    fi
+    if [[ "${s}" -gt 0 ]]; then
+        [[ -n "${parts}" ]] && parts="${parts}&nbsp;"
+        parts="${parts}<span style='color:#F39C12;'>${s}&nbsp;skip</span>"
+    fi
+    if [[ "${cn}" -gt 0 ]]; then
+        [[ -n "${parts}" ]] && parts="${parts}&nbsp;"
+        parts="${parts}<span style='color:#888;'>${cn}&nbsp;cnl</span>"
+    fi
+    printf '%s' "${parts}"
+}
+
+get_daily_action_stats() {
     REPORT_ROWS=""
-    local days_ago
-    for days_ago in 0 1 2; do
-        local start_date end_date start_label end_label
-        start_date=$(date_ago_days $((days_ago + 1)))
-        end_date=$(date_ago_days ${days_ago})
-        start_label=$(date_short_label "${start_date}")
-        end_label=$(date_short_label "${end_date}")
+    # Pick last 3 scheduled reports (most recent first)
+    local reports_subset count
+    reports_subset=$(echo "${REPORTS_JSON}" | jq '
+        [.items[] | select(.metadata.generateName? | tostring | startswith("scheduled-"))]
+        | sort_by(.metadata.creationTimestamp) | reverse | .[0:3]
+    ')
+    count=$(echo "${reports_subset}" | jq 'length')
 
-        local total_actions error_actions
-        total_actions=$(echo "${RUNACTIONS_JSON}" | jq \
-            --arg s "${start_date}T00:00:00Z" --arg e "${end_date}T23:59:59Z" \
-            '[.items[] | select(.metadata.creationTimestamp >= $s and .metadata.creationTimestamp <= $e)] | length' \
-            2>/dev/null || echo "0")
+    if [[ "${count}" -eq 0 ]]; then
+        REPORT_ROWS="<tr><td colspan='5' style='padding:12px;text-align:center;color:#888;font-style:italic;'>No scheduled K10 reports found</td></tr>"
+        return
+    fi
 
-        # Normalize state matching: handles "Failed", "failed", "Error", "fail*", "error*"
-        error_actions=$(echo "${RUNACTIONS_JSON}" | jq \
-            --arg s "${start_date}T00:00:00Z" --arg e "${end_date}T23:59:59Z" \
-            '[.items[]
-              | select(.metadata.creationTimestamp >= $s and .metadata.creationTimestamp <= $e)
-              | select((.status.state // "" | ascii_downcase) | test("^(fail|error)"))
-             ] | length' \
-            2>/dev/null || echo "0")
+    local i
+    for i in $(seq 0 $((count - 1))); do
+        local report row_bg report_date date_label
+        report=$(echo "${reports_subset}" | jq ".[${i}]")
+        report_date=$(echo "${report}" | jq -r '.spec.statsIntervalEndTimestamp // .spec.reportTimestamp // .metadata.creationTimestamp // ""')
+        date_label=$(portable_date_fmt "${report_date}" "%b %d")
 
-        local error_color="#27AE60"
-        if [[ "${error_actions}" -gt 0 ]]; then error_color="#E74C3C"; fi
+        # Extract per-action-type stats in a single jq invocation each.
+        # Format: "completed failed skipped cancelled"
+        local backup_stats export_stats import_stats run_stats
+        backup_stats=$(echo "${report}" | jq -r '.results.actions.countStats.backup | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
+        export_stats=$(echo "${report}" | jq -r '.results.actions.countStats.export | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
+        import_stats=$(echo "${report}" | jq -r '.results.actions.countStats.import | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
+        run_stats=$(echo    "${report}" | jq -r '.results.actions.countStats.run    | "\(.completed//0) \(.failed//0) \(.skipped//0) \(.cancelled//0)"' 2>/dev/null || echo "0 0 0 0")
 
-        local row_bg=""
-        if [[ $((days_ago % 2)) -eq 1 ]]; then row_bg=' style="background-color:#F7F9FC;"'; fi
+        row_bg=""
+        if [[ $((i % 2)) -eq 1 ]]; then row_bg=' style="background-color:#F7F9FC;"'; fi
 
         REPORT_ROWS+="
         <tr${row_bg}>
-            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${start_label} – ${end_label}</td>
-            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>${total_actions}</td>
-            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;color:${error_color};font-weight:600;'>${error_actions}</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${date_label}</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${backup_stats}")</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${export_stats}")</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${import_stats}")</td>
+            <td style='padding:10px 14px;border-bottom:1px solid #E8E8E8;text-align:center;'>$(render_action_cell "${run_stats}")</td>
+        </tr>"
+    done
+}
+
+# ─── Top failed/skipped exports (last 5) ──────────────────────────────────────
+# Source: exportactions.actions.kio.kasten.io
+# Labels:  k10.kasten.io/policyName, /policyNamespace, /actionSkipReason
+# App namespace: extracted from status.exceptions[].fields[].value (subject JSON)
+get_failed_exports() {
+    FAILED_EXPORT_ROWS=""
+    FAILED_EXPORT_COUNT=0
+
+    local failed_json count
+    # Filter Failed + Skipped, sort by endTime desc, top 5
+    failed_json=$(echo "${EXPORTACTIONS_JSON}" | jq '
+        [.items[]
+         | select(.status.state == "Failed" or .status.state == "Skipped")
+         | {
+             name:         .metadata.name,
+             state:        .status.state,
+             endTime:      (.status.endTime // .metadata.creationTimestamp),
+             policyName:   (.metadata.labels["k10.kasten.io/policyName"]      // "—"),
+             policyNs:     (.metadata.labels["k10.kasten.io/policyNamespace"] // "—"),
+             skipReason:   (.metadata.labels["k10.kasten.io/actionSkipReason"] // ""),
+             errorMsg:     (.status.error // (.status.exceptions[0].message // "")),
+             appNs: (
+               # Try label first (some K10 versions populate it)
+               .metadata.labels["k10.kasten.io/appNamespace"] //
+               # Else parse the "subject" field from exceptions
+               (try ((.status.exceptions // [])
+                     | map(.fields // []) | flatten
+                     | map(select(.name == "subject")) | .[0].value
+                     | fromjson | .app.namespace.name) catch null) //
+               "—"
+             )
+           }
+        ]
+        | sort_by(.endTime) | reverse | .[0:5]
+    ' 2>/dev/null || echo '[]')
+
+    count=$(echo "${failed_json}" | jq 'length')
+    FAILED_EXPORT_COUNT="${count}"
+
+    if [[ "${count}" -eq 0 ]]; then
+        return
+    fi
+
+    local i
+    for i in $(seq 0 $((count - 1))); do
+        local entry name state endt policy policy_ns skip_reason error_msg app_ns
+        entry=$(echo "${failed_json}" | jq ".[${i}]")
+        name=$(echo       "${entry}" | jq -r '.name')
+        state=$(echo      "${entry}" | jq -r '.state')
+        endt=$(echo       "${entry}" | jq -r '.endTime')
+        policy=$(echo     "${entry}" | jq -r '.policyName')
+        policy_ns=$(echo  "${entry}" | jq -r '.policyNs')
+        skip_reason=$(echo "${entry}" | jq -r '.skipReason')
+        error_msg=$(echo  "${entry}" | jq -r '.errorMsg')
+        app_ns=$(echo     "${entry}" | jq -r '.appNs')
+
+        # Reason: for Skipped use skipReason label; for Failed use error_msg
+        local reason=""
+        if [[ "${state}" == "Skipped" && -n "${skip_reason}" && "${skip_reason}" != "null" ]]; then
+            reason="${skip_reason}"
+        elif [[ -n "${error_msg}" && "${error_msg}" != "null" ]]; then
+            reason="${error_msg}"
+        else
+            reason="—"
+        fi
+
+        # Truncate very long reasons (keep email readable)
+        if [[ ${#reason} -gt 120 ]]; then
+            reason="${reason:0:117}..."
+        fi
+
+        local endt_pretty
+        endt_pretty=$(portable_date_fmt "${endt}" "%b %d, %H:%M")
+
+        local state_color="#E74C3C" state_icon="&#10007;"
+        if [[ "${state}" == "Skipped" ]]; then
+            state_color="#F39C12"; state_icon="&#9888;"
+        fi
+
+        local row_bg=""
+        if [[ $((i % 2)) -eq 1 ]]; then row_bg=' style="background-color:#F7F9FC;"'; fi
+
+        local h_policy h_policy_ns h_app_ns h_reason h_endt
+        h_policy=$(html_escape    "${policy}")
+        h_policy_ns=$(html_escape "${policy_ns}")
+        h_app_ns=$(html_escape    "${app_ns}")
+        h_reason=$(html_escape    "${reason}")
+        h_endt=$(html_escape      "${endt_pretty}")
+
+        FAILED_EXPORT_ROWS+="
+        <tr${row_bg}>
+            <td style='padding:8px 12px;border-bottom:1px solid #E8E8E8;text-align:center;color:${state_color};font-weight:700;'>${state_icon} ${state}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #E8E8E8;'>${h_endt}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #E8E8E8;font-weight:600;'>${h_policy}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #E8E8E8;color:#666;'>${h_app_ns}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #E8E8E8;color:#555;font-size:12px;'>${h_reason}</td>
         </tr>"
     done
 }
 
 # ─── Storage & Report Data ────────────────────────────────────────────────────
+# Reads from REPORTS_JSON cache (loaded by load_reports).
+# Schema (K10 8.5.x):
+#   results.storage.objectStorage.{physicalBytes, logicalBytes, count}
+#   results.storage.snapshotStorage.{physicalBytes, logicalBytes, count}
+#   results.storage.pvcStats.{pvcBytes, pvcCount}
+#   results.compliance.{applicationCount, compliantCount, nonCompliantCount, unmanagedCount}
+#   results.general.k10Version
+#   results.licensing.{nodeCount, nodeLimit, expiry, status, type}
 get_storage_info() {
     SNAPSHOT_SIZE="N/A"
     OBJECT_STORAGE="N/A"
@@ -351,71 +523,64 @@ get_storage_info() {
     REPORT_COMPLIANCE_UNMANAGED=""
     REPORT_K10_VERSION=""
 
-    local report_json report_count
-    report_json=$(${K} get reports.reporting.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
-        --sort-by='.metadata.creationTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
-    report_count=$(echo "${report_json}" | jq '.items | length')
+    # License fields from report (used by get_license_info if available)
+    REPORT_LIC_NODE_COUNT=""
+    REPORT_LIC_NODE_LIMIT=""
+    REPORT_LIC_EXPIRY=""
+    REPORT_LIC_STATUS=""
+    REPORT_LIC_TYPE=""
+
+    local report_count
+    report_count=$(echo "${REPORTS_JSON}" | jq '.items | length')
 
     if [[ "${report_count}" -gt 0 ]]; then
         local last_report
-        last_report=$(echo "${report_json}" | jq '.items[-1]')
+        last_report=$(echo "${REPORTS_JSON}" | jq '.items[-1]')
 
-        local result_keys
-        result_keys=$(echo "${last_report}" | jq -r '.results | keys | join(", ")' 2>/dev/null || echo "none")
-        log "  → Report .results keys: ${result_keys}"
+        # ── Storage (K10 8.5.x schema) ──
+        local obj_phys snap_phys
+        obj_phys=$(echo "${last_report}"  | jq -r '.results.storage.objectStorage.physicalBytes   // 0' 2>/dev/null || echo "0")
+        snap_phys=$(echo "${last_report}" | jq -r '.results.storage.snapshotStorage.physicalBytes // 0' 2>/dev/null || echo "0")
 
-        TOTAL_BACKUP_DATA=$(echo "${last_report}" | jq -r '
-            (.results.storage.totalBackupData //
-             .results.storage.totalSize //
-             .results.dataUsage.totalBackupData //
-             .results.dataUsage.total //
-             .results.protection.totalSize //
-             .results.general.totalBackupData //
-             .results.general.dataSize //
-             null)
-        ' 2>/dev/null || true)
+        if [[ "${obj_phys}" =~ ^[0-9]+$ ]];  then OBJECT_STORAGE=$(humanize_bytes "${obj_phys}");  fi
+        if [[ "${snap_phys}" =~ ^[0-9]+$ ]]; then SNAPSHOT_SIZE=$(humanize_bytes "${snap_phys}");  fi
 
-        SNAPSHOT_SIZE=$(echo "${last_report}" | jq -r '
-            (.results.storage.snapshotSize //
-             .results.dataUsage.snapshotSize //
-             .results.protection.snapshotSize //
-             null)
-        ' 2>/dev/null || true)
+        # Total = object storage physical + snapshot physical
+        if [[ "${obj_phys}" =~ ^[0-9]+$ && "${snap_phys}" =~ ^[0-9]+$ ]]; then
+            TOTAL_BACKUP_DATA=$(humanize_bytes $(( obj_phys + snap_phys )))
+        fi
 
-        OBJECT_STORAGE=$(echo "${last_report}" | jq -r '
-            (.results.storage.exportSize //
-             .results.storage.objectStorageSize //
-             .results.dataUsage.exportSize //
-             .results.protection.exportSize //
-             null)
-        ' 2>/dev/null || true)
-
-        if [[ -z "${TOTAL_BACKUP_DATA}" || "${TOTAL_BACKUP_DATA}" == "null" ]]; then
-            local size_fields
-            size_fields=$(echo "${last_report}" | jq -r '
-                [path(.. | numbers) | map(tostring) | join(".")]
-                | map(select(test("size|storage|data|byte|volume"; "i")))
-                | join(", ")
+        # ── Older schema fallback (in case fields above are absent) ──
+        if [[ "${TOTAL_BACKUP_DATA}" == "N/A" || "${TOTAL_BACKUP_DATA}" == "0 B" ]]; then
+            local legacy
+            legacy=$(echo "${last_report}" | jq -r '
+                (.results.storage.totalBackupData //
+                 .results.storage.totalSize //
+                 .results.dataUsage.totalBackupData //
+                 .results.dataUsage.total //
+                 null)
             ' 2>/dev/null || true)
-            if [[ -n "${size_fields}" ]]; then
-                log "  → Size-related fields found: ${size_fields}"
-            else
-                log "  → No storage/size fields found in report. Will use PVC fallback."
+            if [[ -n "${legacy}" && "${legacy}" != "null" ]]; then
+                TOTAL_BACKUP_DATA="${legacy}"
             fi
         fi
 
-        if [[ -z "${TOTAL_BACKUP_DATA}" || "${TOTAL_BACKUP_DATA}" == "null" ]]; then TOTAL_BACKUP_DATA="N/A"; fi
-        if [[ -z "${SNAPSHOT_SIZE}"     || "${SNAPSHOT_SIZE}"     == "null" ]]; then SNAPSHOT_SIZE="N/A"; fi
-        if [[ -z "${OBJECT_STORAGE}"    || "${OBJECT_STORAGE}"    == "null" ]]; then OBJECT_STORAGE="N/A"; fi
-
-        REPORT_COMPLIANCE_APPS=$(echo "${last_report}" | jq -r '.results.compliance.applicationCount // empty' 2>/dev/null || true)
-        REPORT_COMPLIANCE_COMPLIANT=$(echo "${last_report}" | jq -r '.results.compliance.compliantCount // empty' 2>/dev/null || true)
+        # Compliance from report (authoritative)
+        REPORT_COMPLIANCE_APPS=$(echo         "${last_report}" | jq -r '.results.compliance.applicationCount // empty' 2>/dev/null || true)
+        REPORT_COMPLIANCE_COMPLIANT=$(echo    "${last_report}" | jq -r '.results.compliance.compliantCount    // empty' 2>/dev/null || true)
         REPORT_COMPLIANCE_NONCOMPLIANT=$(echo "${last_report}" | jq -r '.results.compliance.nonCompliantCount // empty' 2>/dev/null || true)
-        REPORT_COMPLIANCE_UNMANAGED=$(echo "${last_report}" | jq -r '.results.compliance.unmanagedCount // empty' 2>/dev/null || true)
-        REPORT_K10_VERSION=$(echo "${last_report}" | jq -r '.results.general.k10Version // empty' 2>/dev/null || true)
+        REPORT_COMPLIANCE_UNMANAGED=$(echo    "${last_report}" | jq -r '.results.compliance.unmanagedCount    // empty' 2>/dev/null || true)
+        REPORT_K10_VERSION=$(echo             "${last_report}" | jq -r '.results.general.k10Version           // empty' 2>/dev/null || true)
+
+        # License fields (used by get_license_info)
+        REPORT_LIC_NODE_COUNT=$(echo "${last_report}" | jq -r '.results.licensing.nodeCount // empty' 2>/dev/null || true)
+        REPORT_LIC_NODE_LIMIT=$(echo "${last_report}" | jq -r '.results.licensing.nodeLimit // empty' 2>/dev/null || true)
+        REPORT_LIC_EXPIRY=$(echo     "${last_report}" | jq -r '.results.licensing.expiry    // empty' 2>/dev/null || true)
+        REPORT_LIC_STATUS=$(echo     "${last_report}" | jq -r '.results.licensing.status    // empty' 2>/dev/null || true)
+        REPORT_LIC_TYPE=$(echo       "${last_report}" | jq -r '.results.licensing.type      // empty' 2>/dev/null || true)
     fi
 
-    # Fallback: sum PVCs (human-readable)
+    # Fallback if no report: sum PVCs (rough estimate)
     if [[ "${TOTAL_BACKUP_DATA}" == "N/A" ]]; then
         local pvc_json pvc_count total_bytes
         pvc_json=$(${K} get pvc -n "${KASTEN_NAMESPACE}" -o json 2>/dev/null || echo '{"items":[]}')
@@ -433,15 +598,7 @@ get_storage_info() {
             ' 2>/dev/null || echo "0")
 
             if [[ -n "${total_bytes}" && "${total_bytes}" != "null" && "${total_bytes}" -gt 0 ]] 2>/dev/null; then
-                if [[ "${total_bytes}" -ge 1099511627776 ]]; then
-                    TOTAL_BACKUP_DATA=$(echo "${total_bytes}" | awk '{printf "%.1f TiB", $1/1099511627776}')
-                elif [[ "${total_bytes}" -ge 1073741824 ]]; then
-                    TOTAL_BACKUP_DATA=$(echo "${total_bytes}" | awk '{printf "%.1f GiB", $1/1073741824}')
-                elif [[ "${total_bytes}" -ge 1048576 ]]; then
-                    TOTAL_BACKUP_DATA=$(echo "${total_bytes}" | awk '{printf "%.1f MiB", $1/1048576}')
-                else
-                    TOTAL_BACKUP_DATA="${total_bytes} B"
-                fi
+                TOTAL_BACKUP_DATA=$(humanize_bytes "${total_bytes}")
             fi
         fi
     fi
@@ -550,8 +707,33 @@ get_license_info() {
         LIC_NODE_USED=$(${K} get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
     fi
 
+    # ── Enrich/override with K10 report data (authoritative for nodes & expiry) ──
+    # The K10 report exposes results.licensing.{nodeCount, nodeLimit, expiry, status}
+    # which is K10's own view of the license. We prefer it over the YAML secret
+    # for node accounting and expiry status.
+    if [[ -n "${REPORT_LIC_NODE_COUNT}" ]]; then
+        LIC_NODE_USED="${REPORT_LIC_NODE_COUNT}"
+    fi
+    if [[ -n "${REPORT_LIC_NODE_LIMIT}" ]]; then
+        LIC_NODE_LICENSED="${REPORT_LIC_NODE_LIMIT}"
+    fi
+    if [[ -n "${REPORT_LIC_EXPIRY}" && "${REPORT_LIC_EXPIRY}" != "null" ]]; then
+        LIC_EXPIRES="${REPORT_LIC_EXPIRY}"
+    elif [[ -n "${REPORT_LIC_STATUS}" && "${REPORT_LIC_EXPIRY}" == "null" ]]; then
+        # K10 reports expiry: null when license has no end date (e.g. permanent)
+        LIC_EXPIRES="Permanent"
+    fi
+
     # Days remaining
-    if [[ "${LIC_EXPIRES}" != "N/A" && "${LIC_EXPIRES}" != "null" && -n "${LIC_EXPIRES}" ]]; then
+    if [[ "${LIC_EXPIRES}" == "Permanent" ]]; then
+        LIC_DAYS_LEFT="∞"
+        # If K10 report said status: Valid, trust it; else infer green
+        if [[ -n "${REPORT_LIC_STATUS}" && "${REPORT_LIC_STATUS}" == "Valid" ]]; then
+            LIC_STATUS="Valid"; LIC_STATUS_COLOR="#27AE60"
+        else
+            LIC_STATUS="Valid"; LIC_STATUS_COLOR="#27AE60"
+        fi
+    elif [[ "${LIC_EXPIRES}" != "N/A" && "${LIC_EXPIRES}" != "null" && -n "${LIC_EXPIRES}" ]]; then
         local exp_epoch now_epoch
         exp_epoch=$(portable_date_epoch "${LIC_EXPIRES}")
         now_epoch=$(date +%s)
@@ -597,12 +779,24 @@ log "Loading runactions (single fetch, reused)..."
 load_runactions
 log "  → $(echo "${RUNACTIONS_JSON}" | jq '.items | length') runactions loaded"
 
+log "Loading K10 reports (single fetch, reused)..."
+load_reports
+log "  → $(echo "${REPORTS_JSON}" | jq '.items | length') K10 reports loaded"
+
+log "Loading export actions (single fetch)..."
+load_exportactions
+log "  → $(echo "${EXPORTACTIONS_JSON}" | jq '.items | length') export actions loaded"
+
 log "Gathering policy data..."
 get_policies
 log "  → ${TOTAL_POLICIES} policies (${#POLICY_NAMES[@]} enumerated)"
 
-log "Computing daily action counts..."
-get_report_actions
+log "Computing daily action stats (from K10 reports countStats)..."
+get_daily_action_stats
+
+log "Identifying top failed/skipped exports..."
+get_failed_exports
+log "  → ${FAILED_EXPORT_COUNT} failed/skipped export(s) in top-5"
 
 log "Gathering storage info..."
 get_storage_info
@@ -667,6 +861,46 @@ generate_json() {
         done
     fi
 
+    # Build dailyStats array from the last 3 scheduled K10 reports
+    local daily_stats_array
+    daily_stats_array=$(echo "${REPORTS_JSON}" | jq '
+        [.items[] | select(.metadata.generateName? | tostring | startswith("scheduled-"))]
+        | sort_by(.metadata.creationTimestamp) | reverse | .[0:3]
+        | map({
+            date: (.spec.statsIntervalEndTimestamp // .spec.reportTimestamp // .metadata.creationTimestamp),
+            backup:  (.results.actions.countStats.backup  // {}),
+            export:  (.results.actions.countStats.export  // {}),
+            import:  (.results.actions.countStats.import  // {}),
+            restore: (.results.actions.countStats.restore // {}),
+            run:     (.results.actions.countStats.run     // {})
+          })
+    ' 2>/dev/null || echo '[]')
+
+    # Build failedExports array (top 5)
+    local failed_exports_array
+    failed_exports_array=$(echo "${EXPORTACTIONS_JSON}" | jq '
+        [.items[]
+         | select(.status.state == "Failed" or .status.state == "Skipped")
+         | {
+             name:       .metadata.name,
+             state:      .status.state,
+             endTime:    (.status.endTime // .metadata.creationTimestamp),
+             policyName: (.metadata.labels["k10.kasten.io/policyName"]      // null),
+             policyNamespace: (.metadata.labels["k10.kasten.io/policyNamespace"] // null),
+             appNamespace: (
+               .metadata.labels["k10.kasten.io/appNamespace"] //
+               (try ((.status.exceptions // [])
+                     | map(.fields // []) | flatten
+                     | map(select(.name == "subject")) | .[0].value
+                     | fromjson | .app.namespace.name) catch null)
+             ),
+             skipReason: (.metadata.labels["k10.kasten.io/actionSkipReason"] // null),
+             error:      (.status.error // (.status.exceptions[0].message // null))
+           }
+        ]
+        | sort_by(.endTime) | reverse | .[0:5]
+    ' 2>/dev/null || echo '[]')
+
     jq -n \
         --arg date "${TODAY}" \
         --arg time "${TIME_NOW}" \
@@ -701,6 +935,8 @@ generate_json() {
         --arg all_healthy "${ALL_HEALTHY}" \
         --argjson policies "${policy_array}" \
         --argjson services "${service_array}" \
+        --argjson daily_stats "${daily_stats_array}" \
+        --argjson failed_exports "${failed_exports_array}" \
         '{
             "reportDate": $date,
             "reportTime": $time,
@@ -750,7 +986,9 @@ generate_json() {
             "services": {
                 "allHealthy": ($all_healthy == "true"),
                 "details": $services
-            }
+            },
+            "dailyStats": $daily_stats,
+            "failedExports": $failed_exports
         }' > "${JSON_FILE}" 2>/tmp/kasten-json-error.log
 
     if [[ -s "${JSON_FILE}" ]]; then
@@ -934,10 +1172,17 @@ ${LICENSE_BANNER}
     <td style="width:50%;padding:0 0 0 8px;vertical-align:top;"><div style="background:#F7F9FC;border-radius:6px;padding:16px;border:1px solid #E8E8E8;"><div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:10px;">Consumption</div>${NODE_BAR}<div style="font-size:11px;color:#AAA;margin-top:8px;border-top:1px solid #E8E8E8;padding-top:8px;">${FEATURES_LINE}</div></div></td>
 </tr></table>
 
-<h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">3. Daily Reports (Last 3 Days)</h2>
+<h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">3. Daily Action Stats (Last 3 K10 Reports)</h2>
 <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
-<thead><tr style="background:#1B2A4A;"><th style="padding:10px 14px;color:#fff;text-align:left;">Date Range</th><th style="padding:10px 14px;color:#fff;text-align:center;">Total Actions</th><th style="padding:10px 14px;color:#fff;text-align:center;">Errors</th></tr></thead>
+<thead><tr style="background:#1B2A4A;">
+    <th style="padding:10px 14px;color:#fff;text-align:left;">Date</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;">Backup</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;">Export</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;">Import</th>
+    <th style="padding:10px 14px;color:#fff;text-align:center;">Run</th>
+</tr></thead>
 <tbody>${REPORT_ROWS}</tbody></table>
+<p style="margin:6px 2px 0;font-size:11px;color:#888;">Legend: <span style="color:#27AE60;font-weight:600;">N&nbsp;&#10003;</span> completed &nbsp;&bull;&nbsp; <span style="color:#E74C3C;font-weight:700;">N&nbsp;&#10007;</span> failed &nbsp;&bull;&nbsp; <span style="color:#F39C12;">N&nbsp;skip</span> skipped &nbsp;&bull;&nbsp; <span style="color:#888;">N&nbsp;cnl</span> cancelled</p>
 
 <h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">4. Last Policy Run Status</h2>
 <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
@@ -950,7 +1195,22 @@ echo '<thead><tr style="background:#FDECEA;"><th style="padding:10px 14px;color:
 echo "<tbody>${POLICY_ERROR_ROWS}</tbody></table>"
 fi)
 
-<h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">5. Services Status</h2>
+$(if [[ "${FAILED_EXPORT_COUNT}" -gt 0 ]]; then
+cat <<TOPFAILEOF
+<h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">5. Top 5 Failed / Skipped Exports</h2>
+<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+<thead><tr style="background:#1B2A4A;">
+    <th style="padding:8px 12px;color:#fff;text-align:center;">State</th>
+    <th style="padding:8px 12px;color:#fff;text-align:left;">When</th>
+    <th style="padding:8px 12px;color:#fff;text-align:left;">Policy</th>
+    <th style="padding:8px 12px;color:#fff;text-align:left;">App Namespace</th>
+    <th style="padding:8px 12px;color:#fff;text-align:left;">Reason</th>
+</tr></thead>
+<tbody>${FAILED_EXPORT_ROWS}</tbody></table>
+TOPFAILEOF
+fi)
+
+<h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">6. Services Status</h2>
 ${HEALTH_BANNER}
 <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
 <thead><tr style="background:#1B2A4A;"><th style="padding:8px 14px;color:#fff;text-align:left;">Service</th><th style="padding:8px 14px;color:#fff;text-align:center;">Replicas</th><th style="padding:8px 14px;color:#fff;text-align:center;">Status</th></tr></thead>

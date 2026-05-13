@@ -8,13 +8,14 @@ Tested on **K10 8.5.3** and **K10 8.5.8** on OpenShift and vanilla Kubernetes.
 
 | Section | Source |
 |---|---|
-| Applications & compliance | `applications.apps.kio.kasten.io` CRs |
-| License validity & expiry | `k10-license` secret (YAML decoded) |
-| Consumption (nodes) | License secret + `oc get nodes` fallback |
+| Applications & compliance | K10 report `results.compliance` (authoritative) |
+| License validity & expiry | K10 report `results.licensing` + `k10-license` secret fallback |
+| Consumption (nodes) | K10 report `results.licensing.{nodeCount,nodeLimit}` |
 | Policies (backup/import/system) | `policies.config.kio.kasten.io` CRs |
 | Last policy run status & errors | `runactions.actions.kio.kasten.io` CRs |
-| Daily action counts (3 days) | RunAction timestamps |
-| Storage stats | `reports.reporting.kio.kasten.io` or PVCs |
+| **Daily action stats (last 3 reports)** | K10 report `results.actions.countStats` — ventilated by **backup / export / import / run** × **completed / failed / skipped / cancelled** |
+| **Top 5 failed/skipped exports** | `exportactions.actions.kio.kasten.io` (state + policy + app namespace + reason) |
+| Storage stats | K10 report `results.storage.{objectStorage,snapshotStorage}.physicalBytes` |
 | Services health | Deployment readiness in kasten-io namespace |
 
 ## CLI auto-detection
@@ -46,24 +47,55 @@ When sending email, the HTML is the **email body** and the JSON is **attached** 
   "reportDate": "2026-05-13",
   "reportTime": "08:00 CET",
   "cluster": {
-    "name": "...",
+    "name": "oc02",
     "instanceId": "...",
     "kastenVersion": "8.5.8",
     "isOpenShift": true
   },
-  "applications": { "total": 79, "compliant": 0, "nonCompliant": 0, "unmanaged": 79 },
+  "applications": { "total": 74, "compliant": 0, "nonCompliant": 0, "unmanaged": 74 },
   "policies": {
     "total": 3, "backup": 2, "import": 0, "system": 1, "failed": 0,
     "details": [...]
   },
-  "storage": { "totalBackupData": "90.9 MiB", "snapshotSize": "0 B", "objectStorage": "91 MiB" },
+  "storage": { "totalBackupData": "85.4 MiB", "snapshotSize": "0 B", "objectStorage": "85.4 MiB" },
   "license": {
-    "customer": "...", "product": "K10", "expires": "...", "daysLeft": 358,
-    "consumption": { "nodes": { "used": 3, "licensed": 10, "percent": 30 } }
+    "customer": "...", "product": "K10", "expires": "Permanent", "daysLeft": "∞",
+    "consumption": { "nodes": { "used": 1, "licensed": 5, "percent": 20 } }
   },
+  "dailyStats": [
+    {
+      "date": "2026-03-14T00:00:00Z",
+      "backup":  { "completed": 5, "failed": 2, "skipped": 0, "cancelled": 0 },
+      "export":  { "completed": 3, "failed": 0, "skipped": 4, "cancelled": 0 },
+      "import":  { "completed": 0, "failed": 4, "skipped": 0, "cancelled": 0 },
+      "restore": { "completed": 0, "failed": 0, "skipped": 0, "cancelled": 0 },
+      "run":     { "completed": 5, "failed": 2, "skipped": 0, "cancelled": 0 }
+    }
+  ],
+  "failedExports": [
+    {
+      "name": "run-nnjr9sk6gkllrb4",
+      "state": "Skipped",
+      "endTime": "2026-05-13T01:03:21Z",
+      "policyName": "smoke-test1",
+      "policyNamespace": "kasten-io",
+      "appNamespace": "openshift-etcd",
+      "skipReason": "noapplicationselected",
+      "error": null
+    }
+  ],
   "services": { "allHealthy": true, "details": [...] }
 }
 ```
+
+### Daily action stats column legend (HTML)
+
+| Symbol | Meaning |
+|---|---|
+| `N ✓` (green) | Completed |
+| `N ✗` (red) | Failed |
+| `N skip` (orange) | Skipped |
+| `N cnl` (grey) | Cancelled |
 
 ## Quick start
 
@@ -164,17 +196,19 @@ The report applies color-coded alerts based on thresholds:
 | 31–90 days remaining | Orange | Plan renewal |
 | ≤ 30 days remaining | Red | Expiring soon — action required |
 | Past expiry date | Red | EXPIRED — renew immediately |
+| Permanent license (expiry: null) | Green | Valid, no expiry |
 | Node usage ≥ 80% | Orange | Approaching limit |
 | Node usage ≥ 95% | Red | Near or at capacity |
 | Non-compliant apps > 0 OR failed policies > 0 | Red top banner | Action required |
 
-The script tries multiple CRDs in order: `licenses.vault.kio.kasten.io` (K10 7.x+), `licenses.licensing.kio.kasten.io` (older), then falls back to the `k10-license` secret. Node count falls back to `oc get nodes` / `kubectl get nodes` if not in the license CR.
+The script reads the K10 report (`reports.reporting.kio.kasten.io`) as the authoritative source for compliance, licensing, storage and action stats. The YAML-encoded `k10-license` secret is used as fallback for product/customer fields not exposed in the report.
 
 ## Security & robustness notes
 
-- **HTML escaping:** All cluster-derived strings (policy names, error messages, customer name, license ID, service names) are HTML-escaped before injection into the report.
+- **HTML escaping:** All cluster-derived strings (policy names, error messages, customer name, license ID, service names, export reasons, app namespaces) are HTML-escaped before injection into the report.
 - **SMTP heredoc:** The Python SMTP block uses a quoted heredoc and reads credentials/paths from `os.environ`, preventing shell injection through arbitrary input.
-- **Run-action queries:** Run actions are fetched **once** per script run and reused for all per-policy/per-day filtering (O(1) API calls instead of O(N policies × 3 days)).
+- **Single-fetch caches:** Run actions, K10 reports and export actions are each fetched **once** per script run and reused. Old code had N+1 query patterns.
+- **K10 report as source of truth:** Daily action counts come from K10's own `results.actions.countStats` (ventilated by action type), not from filtering RunActions on timestamps. License and storage are equally read from the report.
 - **Retention:** Old reports are auto-deleted based on `RETENTION_DAYS` (default 30). Set to `0` to keep everything.
 
 ## Requirements
