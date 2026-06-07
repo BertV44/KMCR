@@ -699,14 +699,69 @@ get_license_info() {
     LIC_STATUS="Unknown"; LIC_STATUS_COLOR="#999999"; LIC_FEATURES=""
     LIC_NODE_LICENSED="N/A"; LIC_NODE_USED="N/A"; LIC_NODE_PCT="0"
 
-    local raw_b64 decoded
-    raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" k10-license -o jsonpath='{.data.license}' 2>/dev/null || true)
+    # ── Enumerate every k10-license* secret and prefer the non-starter license ──
+    # The built-in `k10-license` secret holds the starter license (customer
+    # "starter-license", expiry ~2100). Enterprise/renewal licenses are installed
+    # as additional k10-license* secrets. Reading only `k10-license` (old
+    # behaviour) always surfaced the starter license — BUG-01. Enumerate every
+    # k10-license* secret, parse each defensively, and select the non-starter one
+    # with the nearest real expiry; fall back to the starter license with an
+    # explicit flag when no enterprise license is present.
+    local secret_names sname raw_b64 decoded
+    local starter_decoded="" chosen_decoded="" chosen_exp_epoch=0
 
-    if [[ -n "${raw_b64}" ]]; then
-        decoded=$(echo "${raw_b64}" | base64 -d 2>/dev/null || echo "${raw_b64}" | base64 -D 2>/dev/null || true)
+    secret_names=$(${K} get secrets -n "${KASTEN_NAMESPACE}" -o json 2>/dev/null \
+        | jq -r '[.items[]? | select(.metadata.name | startswith("k10-license")) | .metadata.name] | .[]' 2>/dev/null || true)
+    # Broaden to any *license* secret if the k10-license* prefix matched nothing.
+    if [[ -z "${secret_names}" ]]; then
+        secret_names=$(${K} get secrets -n "${KASTEN_NAMESPACE}" --no-headers 2>/dev/null \
+            | grep -i license | awk '{print $1}' || true)
     fi
 
-    if [[ -n "${decoded:-}" ]]; then
+    for sname in ${secret_names}; do
+        raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" "${sname}" -o jsonpath='{.data.license}' 2>/dev/null \
+            || ${K} get secret -n "${KASTEN_NAMESPACE}" "${sname}" -o jsonpath='{.data.License}' 2>/dev/null || true)
+        [[ -z "${raw_b64}" ]] && continue
+        decoded=$(echo "${raw_b64}" | base64 -d 2>/dev/null || echo "${raw_b64}" | base64 -D 2>/dev/null || true)
+        [[ -z "${decoded}" ]] && continue
+
+        local c_customer c_id c_end is_starter exp_epoch
+        c_customer=$(yaml_val "${decoded}" "customerName")
+        c_id=$(yaml_val "${decoded}" "id")
+        # Skip payloads with no recognisable license signature.
+        [[ -z "${c_customer}" && -z "${c_id}" ]] && continue
+
+        is_starter=false
+        if [[ "${c_customer}" == "starter-license" || "${c_id}" == starter-* ]]; then
+            is_starter=true
+        fi
+
+        if [[ "${is_starter}" == true ]]; then
+            [[ -z "${starter_decoded}" ]] && starter_decoded="${decoded}"
+            continue
+        fi
+
+        # Non-starter candidate: keep the one with the nearest (smallest) real expiry.
+        c_end=$(yaml_val "${decoded}" "dateEnd")
+        exp_epoch=0
+        if [[ -n "${c_end}" && "${c_end}" != "null" ]]; then
+            exp_epoch=$(portable_date_epoch "${c_end}")
+        fi
+        if [[ -z "${chosen_decoded}" ]]; then
+            chosen_decoded="${decoded}"; chosen_exp_epoch="${exp_epoch}"
+        elif [[ "${exp_epoch}" -gt 0 && ( "${chosen_exp_epoch}" -le 0 || "${exp_epoch}" -lt "${chosen_exp_epoch}" ) ]]; then
+            chosen_decoded="${decoded}"; chosen_exp_epoch="${exp_epoch}"
+        fi
+    done
+
+    # Fall back to the starter license (flagged) when no enterprise license found.
+    local from_starter=false
+    if [[ -z "${chosen_decoded}" && -n "${starter_decoded}" ]]; then
+        chosen_decoded="${starter_decoded}"; from_starter=true
+    fi
+
+    if [[ -n "${chosen_decoded}" ]]; then
+        decoded="${chosen_decoded}"
         LIC_CUSTOMER=$(yaml_val "${decoded}" "customerName")
         LIC_TYPE=$(yaml_val "${decoded}" "product")
         LIC_ID=$(yaml_val "${decoded}" "id")
@@ -725,31 +780,11 @@ get_license_info() {
         fi
 
         LIC_PLATFORM="Kubernetes"
-    fi
 
-    # Fallback: license secrets with alternate names
-    if [[ -z "${decoded:-}" ]]; then
-        local lic_secret_name
-        lic_secret_name=$(${K} get secrets -n "${KASTEN_NAMESPACE}" --no-headers 2>/dev/null \
-            | grep -i license | head -1 | awk '{print $1}' || true)
-        if [[ -n "${lic_secret_name}" ]]; then
-            raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" "${lic_secret_name}" \
-                -o jsonpath='{.data.license}' 2>/dev/null \
-                || ${K} get secret -n "${KASTEN_NAMESPACE}" "${lic_secret_name}" \
-                -o jsonpath='{.data.License}' 2>/dev/null || true)
-            if [[ -n "${raw_b64}" ]]; then
-                decoded=$(echo "${raw_b64}" | base64 -d 2>/dev/null || echo "${raw_b64}" | base64 -D 2>/dev/null || true)
-                if [[ -n "${decoded}" ]]; then
-                    LIC_CUSTOMER=$(yaml_val "${decoded}" "customerName")
-                    LIC_TYPE=$(yaml_val "${decoded}" "product")
-                    LIC_ID=$(yaml_val "${decoded}" "id")
-                    LIC_ISSUED=$(yaml_val "${decoded}" "dateStart")
-                    LIC_EXPIRES=$(yaml_val "${decoded}" "dateEnd")
-                    LIC_NODE_LICENSED=$(echo "${decoded}" | grep -m1 "nodes:" | sed "s/.*nodes:[[:space:]]*//" | sed "s/^['\"]//;s/['\"]$//")
-                    if [[ -z "${LIC_NODE_LICENSED}" ]]; then LIC_NODE_LICENSED="Unlimited"; fi
-                    LIC_PLATFORM="Kubernetes"
-                fi
-            fi
+        # Make the fallback explicit so the report never silently shows the
+        # built-in starter license as if it were the customer's real entitlement.
+        if [[ "${from_starter}" == true ]]; then
+            LIC_CUSTOMER="${LIC_CUSTOMER} [starter-license intégrée]"
         fi
     fi
 
