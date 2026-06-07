@@ -217,10 +217,15 @@ get_applications() {
 }
 
 # ─── Run actions: single fetch, reused everywhere ─────────────────────────────
-# Cached JSON of all runactions in the namespace, sorted by creation timestamp.
+# Cached JSON of all runactions cluster-wide, sorted by creation timestamp.
+# On K10 8.x, policy-driven action CRs are created in the source application
+# namespace, NOT the K10 namespace. Fetching with `-n $KASTEN_NAMESPACE` made
+# per-policy last-run status read "No runs" and under-counted failed policies on
+# clusters with real failures. Fetch cluster-wide (-A); the policyName label
+# filter downstream is namespace-agnostic. (Mirrors Kasten-Disco-Lite #15.)
 RUNACTIONS_JSON=""
 load_runactions() {
-    RUNACTIONS_JSON=$(${K} get runactions.actions.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
+    RUNACTIONS_JSON=$(${K} get runactions.actions.kio.kasten.io -A \
         --sort-by='.metadata.creationTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
 }
 
@@ -232,9 +237,12 @@ load_reports() {
 }
 
 # ─── Export actions: single fetch for top-failed-exports table ────────────────
+# Cluster-wide (-A): exportaction CRs live in the source application namespace,
+# not the K10 namespace, so a namespace-scoped fetch made "Top failed/skipped
+# exports" show empty despite real failures. (Mirrors Kasten-Disco-Lite #15.)
 EXPORTACTIONS_JSON=""
 load_exportactions() {
-    EXPORTACTIONS_JSON=$(${K} get exportactions.actions.kio.kasten.io -n "${KASTEN_NAMESPACE}" \
+    EXPORTACTIONS_JSON=$(${K} get exportactions.actions.kio.kasten.io -A \
         -o json 2>/dev/null || echo '{"items":[]}')
 }
 
@@ -483,6 +491,8 @@ get_failed_exports() {
                      | map(.fields // []) | flatten
                      | map(select(.name == "subject")) | .[0].value
                      | fromjson | .app.namespace.name) catch null) //
+               # Else the namespace of the CR itself (cluster-wide fetch, #15)
+               .metadata.namespace //
                "—"
              )
            }
@@ -998,7 +1008,8 @@ generate_json() {
                (try ((.status.exceptions // [])
                      | map(.fields // []) | flatten
                      | map(select(.name == "subject")) | .[0].value
-                     | fromjson | .app.namespace.name) catch null)
+                     | fromjson | .app.namespace.name) catch null) //
+               .metadata.namespace
              ),
              skipReason: (.metadata.labels["k10.kasten.io/actionSkipReason"] // null),
              error:      (.status.error // (.status.exceptions[0].message // null))
