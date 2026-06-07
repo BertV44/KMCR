@@ -244,10 +244,12 @@ humanize_bytes() {
     if ! [[ "${b}" =~ ^[0-9]+$ ]] || [[ "${b}" -eq 0 ]]; then
         echo "0 B"; return
     fi
-    if   [[ "${b}" -ge 1099511627776 ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f TiB", n/1099511627776}'
-    elif [[ "${b}" -ge 1073741824    ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f GiB", n/1073741824}'
-    elif [[ "${b}" -ge 1048576       ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f MiB", n/1048576}'
-    elif [[ "${b}" -ge 1024          ]]; then awk -v n="${b}" 'BEGIN{printf "%.1f KiB", n/1024}'
+    # LC_ALL=C forces a '.' decimal separator. Without it, fr_FR locales render
+    # "85,4 MiB" (comma), breaking display and JSON numeric expectations (KDL 214ae61).
+    if   [[ "${b}" -ge 1099511627776 ]]; then LC_ALL=C awk -v n="${b}" 'BEGIN{printf "%.1f TiB", n/1099511627776}'
+    elif [[ "${b}" -ge 1073741824    ]]; then LC_ALL=C awk -v n="${b}" 'BEGIN{printf "%.1f GiB", n/1073741824}'
+    elif [[ "${b}" -ge 1048576       ]]; then LC_ALL=C awk -v n="${b}" 'BEGIN{printf "%.1f MiB", n/1048576}'
+    elif [[ "${b}" -ge 1024          ]]; then LC_ALL=C awk -v n="${b}" 'BEGIN{printf "%.1f KiB", n/1024}'
     else                                      echo "${b} B"
     fi
 }
