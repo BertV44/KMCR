@@ -216,6 +216,32 @@ get_applications() {
     fi
 }
 
+# ─── Shared jq helpers for K10 action errors ──────────────────────────────────
+# K10 stores .status.error as a deeply nested object whose `cause` is itself a
+# JSON-encoded string. Dumping it verbatim produced unreadable multi-KB blobs in
+# the report. Single-quoted so jq's own $-variables are NOT expanded by bash.
+#   deepmsg  -> the deepest human-readable `message` (prefers a brace-free leaf,
+#               i.e. a clean sentence over an embedded-JSON string).
+#   errappns -> the appNamespace buried in the error's `fields`, since policy-run
+#               action CRs live in the K10 namespace, not the app namespace (#15).
+JQ_ERR_HELPERS='
+def deepmsg:
+  . as $e
+  | if $e == null then ""
+    elif ($e|type) == "string" then $e
+    elif ($e|type) == "object" then
+      ( ($e.cause // null) | (if type == "string" then (try fromjson catch null) else . end) ) as $c
+      | [ ($c // {}) | .. | objects | (.message? // empty) | select(type == "string" and (.|length > 0)) ] as $all
+      | ( [ $all[] | select(test("[{}]") | not) ] ) as $clean
+      | ( ($clean | last) // ($all | last) // $e.message // "" )
+    else "" end;
+def errappns:
+  if (type == "object") then
+    ( (.cause // null) | (if type == "string" then (try fromjson catch null) else . end) ) as $c
+    | ( [ ($c // {}) | .. | objects | select(.name? == "appNamespace") | .value ] | last )
+  else null end;
+'
+
 # ─── Run actions: single fetch, reused everywhere ─────────────────────────────
 # Cached JSON of all runactions cluster-wide, sorted by creation timestamp.
 # On K10 8.x, policy-driven action CRs are created in the source application
@@ -305,7 +331,7 @@ get_policies() {
             last_status=$(echo "${run_json}" | jq -r '.items[-1].status.state // "Unknown"')
             last_time=$(echo "${run_json}" | jq -r '.items[-1].status.endTime // .items[-1].metadata.creationTimestamp // "N/A"')
             action_count=$(echo "${run_json}" | jq -r '.items[-1].status.actions // 0')
-            error_msg=$(echo "${run_json}" | jq -r '.items[-1].status.error // ""')
+            error_msg=$(echo "${run_json}" | jq -r "${JQ_ERR_HELPERS}"'.items[-1].status.error | deepmsg')
 
             local lower_status
             lower_status=$(to_lower "${last_status}")
@@ -472,7 +498,7 @@ get_failed_exports() {
 
     local failed_json count
     # Filter Failed + Skipped, sort by endTime desc, top 5
-    failed_json=$(echo "${EXPORTACTIONS_JSON}" | jq '
+    failed_json=$(echo "${EXPORTACTIONS_JSON}" | jq "${JQ_ERR_HELPERS}"'
         [.items[]
          | select(.status.state == "Failed" or .status.state == "Skipped")
          | {
@@ -482,7 +508,8 @@ get_failed_exports() {
              policyName:   (.metadata.labels["k10.kasten.io/policyName"]      // "—"),
              policyNs:     (.metadata.labels["k10.kasten.io/policyNamespace"] // "—"),
              skipReason:   (.metadata.labels["k10.kasten.io/actionSkipReason"] // ""),
-             errorMsg:     (.status.error // (.status.exceptions[0].message // "")),
+             # Deepest human-readable cause, not the raw nested-JSON error object.
+             errorMsg:     ((.status.error // .status.exceptions[0].message) | deepmsg),
              appNs: (
                # Try label first (some K10 versions populate it)
                .metadata.labels["k10.kasten.io/appNamespace"] //
@@ -491,6 +518,8 @@ get_failed_exports() {
                      | map(.fields // []) | flatten
                      | map(select(.name == "subject")) | .[0].value
                      | fromjson | .app.namespace.name) catch null) //
+               # Else the appNamespace field buried in the error cause chain
+               (.status.error | errappns) //
                # Else the namespace of the CR itself (cluster-wide fetch, #15)
                .metadata.namespace //
                "—"
@@ -994,7 +1023,7 @@ generate_json() {
 
     # Build failedExports array (top 5)
     local failed_exports_array
-    failed_exports_array=$(echo "${EXPORTACTIONS_JSON}" | jq '
+    failed_exports_array=$(echo "${EXPORTACTIONS_JSON}" | jq "${JQ_ERR_HELPERS}"'
         [.items[]
          | select(.status.state == "Failed" or .status.state == "Skipped")
          | {
@@ -1009,10 +1038,11 @@ generate_json() {
                      | map(.fields // []) | flatten
                      | map(select(.name == "subject")) | .[0].value
                      | fromjson | .app.namespace.name) catch null) //
+               (.status.error | errappns) //
                .metadata.namespace
              ),
              skipReason: (.metadata.labels["k10.kasten.io/actionSkipReason"] // null),
-             error:      (.status.error // (.status.exceptions[0].message // null))
+             error:      ((.status.error // .status.exceptions[0].message) | deepmsg)
            }
         ]
         | sort_by(.endTime) | reverse | .[0:5]
