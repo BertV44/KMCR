@@ -9,12 +9,12 @@ Tested on **K10 8.5.3** and **K10 8.5.8** on OpenShift and vanilla Kubernetes.
 | Section | Source |
 |---|---|
 | Applications & compliance | K10 report `results.compliance` (authoritative) |
-| License validity & expiry | K10 report `results.licensing` + `k10-license` secret fallback |
+| License validity & expiry | All `k10-license*` secrets (enumerated; non-starter license preferred) + K10 report `results.licensing` |
 | Consumption (nodes) | K10 report `results.licensing.{nodeCount,nodeLimit}` |
 | Policies (backup/import/system) | `policies.config.kio.kasten.io` CRs |
-| Last policy run status & errors | `runactions.actions.kio.kasten.io` CRs |
+| Last policy run status & errors | `runactions.actions.kio.kasten.io` CRs (fetched cluster-wide) |
 | **Daily action stats (last 3 reports)** | K10 report `results.actions.countStats` — ventilated by **backup / export / import / run** × **completed / failed / skipped / cancelled** |
-| **Top 5 failed/skipped exports** | `exportactions.actions.kio.kasten.io` (state + policy + app namespace + reason) |
+| **Top 5 failed/skipped exports** | `exportactions.actions.kio.kasten.io` (fetched cluster-wide; state + policy + app namespace + deepest-cause reason) |
 | Storage stats | K10 report `results.storage.{objectStorage,snapshotStorage}.physicalBytes` |
 | Services health | Deployment readiness in kasten-io namespace |
 
@@ -201,13 +201,15 @@ The report applies color-coded alerts based on thresholds:
 | Node usage ≥ 95% | Red | Near or at capacity |
 | Non-compliant apps > 0 OR failed policies > 0 | Red top banner | Action required |
 
-The script reads the K10 report (`reports.reporting.kio.kasten.io`) as the authoritative source for compliance, licensing, storage and action stats. The YAML-encoded `k10-license` secret is used as fallback for product/customer fields not exposed in the report.
+The script reads the K10 report (`reports.reporting.kio.kasten.io`) as the authoritative source for compliance, licensing, storage and action stats. For license product/customer/dates the script enumerates **all** `k10-license*` secrets (a cluster carries several: the built-in starter license plus enterprise/trial), parses each YAML payload **case-insensitively** (real secrets use lowercase keys, e.g. `customername`/`dateend`), and prefers the non-starter license with the nearest real expiry. If only the starter license exists it is shown with an explicit `[starter-license intégrée]` flag.
 
 ## Security & robustness notes
 
 - **HTML escaping:** All cluster-derived strings (policy names, error messages, customer name, license ID, service names, export reasons, app namespaces) are HTML-escaped before injection into the report.
 - **SMTP heredoc:** The Python SMTP block uses a quoted heredoc and reads credentials/paths from `os.environ`, preventing shell injection through arbitrary input.
 - **Single-fetch caches:** Run actions, K10 reports and export actions are each fetched **once** per script run and reused. Old code had N+1 query patterns.
+- **Cluster-wide action fetch:** On K10 8.x, policy-driven `runaction`/`exportaction` CRs live in the **source application namespace**, not in `kasten-io`. They are fetched cluster-wide (`-A`) so failed/skipped actions actually surface and per-policy status is accurate. This requires cluster-scoped list permission on those CRs (see Requirements).
+- **Readable error messages:** K10 stores `.status.error` as a deeply nested object whose `cause` is itself JSON-encoded. The report extracts the deepest human-readable message (e.g. `persistentvolumeclaims "x" already exists`) instead of dumping the raw blob, and recovers the real app namespace buried in the error fields.
 - **K10 report as source of truth:** Daily action counts come from K10's own `results.actions.countStats` (ventilated by action type), not from filtering RunActions on timestamps. License and storage are equally read from the report.
 - **Retention:** Old reports are auto-deleted based on `RETENTION_DAYS` (default 30). Set to `0` to keep everything.
 
@@ -217,3 +219,4 @@ The script reads the K10 report (`reports.reporting.kio.kasten.io`) as the autho
 - `jq` for JSON parsing
 - `python3` (for SMTP email) or `sendmail`/`mailx`
 - Works on **macOS** (BSD) and **Linux** (GNU) — no `grep -P` or GNU-only date flags
+- **RBAC:** read access in `kasten-io` (secrets, deployments, policies, reports) plus **cluster-wide list** on `runactions`/`exportactions` (`*.actions.kio.kasten.io`) and `nodes`, since action CRs span application namespaces.
