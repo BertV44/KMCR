@@ -726,9 +726,18 @@ get_services_status() {
 # ─── License & Consumption ────────────────────────────────────────────────────
 # K10 license is stored in secret "k10-license" as YAML.
 # Fields: customerName, dateEnd, dateStart, features, id, product, restrictions.nodes
+# Key matching is CASE-INSENSITIVE: real K10 license secrets use lowercase keys
+# (customername/dateend/datestart) while trial/starter payloads use camelCase
+# (customerName/dateEnd). A case-sensitive match returned empty customer/dates
+# and broke starter detection (the wrong license was then selected). The value
+# is taken as everything after the first ':' so embedded colons (ISO dates) are
+# preserved.
 yaml_val() {
     local yaml="$1" key="$2"
-    echo "${yaml}" | grep -m1 "^${key}:" | sed "s/^${key}:[[:space:]]*//" | sed "s/^['\"]//;s/['\"]$//"
+    echo "${yaml}" \
+      | grep -i -m1 "^[[:space:]]*${key}:" \
+      | sed -E "s/^[[:space:]]*[^:]*:[[:space:]]*//" \
+      | sed "s/^['\"]//;s/['\"]$//"
 }
 
 get_license_info() {
