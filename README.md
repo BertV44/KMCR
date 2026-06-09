@@ -13,7 +13,7 @@ Tested on **K10 8.5.3** and **K10 8.5.8** on OpenShift and vanilla Kubernetes.
 | Consumption (nodes) | K10 report `results.licensing.{nodeCount,nodeLimit}` |
 | Policies (backup/import/system) | `policies.config.kio.kasten.io` CRs |
 | Last policy run status & errors | `runactions.actions.kio.kasten.io` CRs (fetched cluster-wide) |
-| **Daily action stats (last 3 reports)** | K10 report `results.actions.countStats` — ventilated by **backup / export / import / run** × **completed / failed / skipped / cancelled** |
+| **Daily action stats (last 3 reports)** | K10 report `results.actions.countStats` — grouped into **Backup / Restore / Export / Autres / Run** × **completed / failed / skipped / cancelled** (Backup = backup+backupCluster, Restore = restore+restoreCluster, Autres = import+report) |
 | **Top 5 failed/skipped exports** | `exportactions.actions.kio.kasten.io` (fetched cluster-wide; state + policy + app namespace + deepest-cause reason) |
 | Storage stats | K10 report `results.storage.{objectStorage,snapshotStorage}.physicalBytes` |
 | Services health | Deployment readiness in kasten-io namespace |
