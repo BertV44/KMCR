@@ -726,18 +726,30 @@ get_services_status() {
 # ─── License & Consumption ────────────────────────────────────────────────────
 # K10 license is stored in secret "k10-license" as YAML.
 # Fields: customerName, dateEnd, dateStart, features, id, product, restrictions.nodes
-# Key matching is CASE-INSENSITIVE: real K10 license secrets use lowercase keys
-# (customername/dateend/datestart) while trial/starter payloads use camelCase
-# (customerName/dateEnd). A case-sensitive match returned empty customer/dates
-# and broke starter detection (the wrong license was then selected). The value
-# is taken as everything after the first ':' so embedded colons (ISO dates) are
-# preserved.
+# Key matching is CASE-INSENSITIVE and TOP-LEVEL ONLY: real K10 license secrets
+# use lowercase keys (customername/dateend/datestart) while trial/starter
+# payloads use camelCase (customerName/dateEnd), so we lowercase both sides.
+# Crucially we match ONLY keys at column 0 (no leading indent): the previous
+# grep matched any indentation, so a nested key (e.g. a `restrictions.id` or an
+# `entitlements.customerName`) could be picked up before the real top-level
+# field. When a nested `id` happened to look like `starter-*`, a genuine
+# ENTERPRISE license was misclassified as starter and skipped — that is why the
+# enterprise license "ne remonte pas". Matching top-level keys only fixes it.
+# (Ported from Kasten-Disco-Lite `_lic_field`, bug #14.)
+# The value is everything after the FIRST ':' so embedded colons (ISO dates)
+# are preserved; surrounding single/double quotes are stripped.
 yaml_val() {
-    local yaml="$1" key="$2"
-    echo "${yaml}" \
-      | grep -i -m1 "^[[:space:]]*${key}:" \
-      | sed -E "s/^[[:space:]]*[^:]*:[[:space:]]*//" \
-      | sed "s/^['\"]//;s/['\"]$//"
+    local yaml="$1" key
+    key=$(to_lower "$2")
+    printf '%s' "${yaml}" | awk -v f="${key}" '
+        /^[^[:space:]]/ {
+            k = $0; sub(/:.*/, "", k); gsub(/[ \t]+$/, "", k)
+            if (tolower(k) == f) {
+                v = $0; sub(/^[^:]*:/, "", v)
+                gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/^["'\'']|["'\'']$/, "", v)
+                print v; exit
+            }
+        }'
 }
 
 get_license_info() {
@@ -747,65 +759,91 @@ get_license_info() {
     LIC_STATUS="Unknown"; LIC_STATUS_COLOR="#999999"; LIC_FEATURES=""
     LIC_NODE_LICENSED="N/A"; LIC_NODE_USED="N/A"; LIC_NODE_PCT="0"
 
-    # ── Enumerate every k10-license* secret and prefer the non-starter license ──
+    # ── Enumerate every *license* secret and prefer the ENTERPRISE license ──────
     # The built-in `k10-license` secret holds the starter license (customer
-    # "starter-license", expiry ~2100). Enterprise/renewal licenses are installed
-    # as additional k10-license* secrets. Reading only `k10-license` (old
-    # behaviour) always surfaced the starter license — BUG-01. Enumerate every
-    # k10-license* secret, parse each defensively, and select the non-starter one
-    # with the nearest real expiry; fall back to the starter license with an
-    # explicit flag when no enterprise license is present.
+    # "starter-license", expiry ~2100). Paid ENTERPRISE and evaluation TRIAL
+    # licenses are installed as additional k10-license* secrets. Reading only
+    # `k10-license` (old behaviour) always surfaced the starter license — BUG-01.
+    #
+    # Enumerate every license secret, classify each payload (ENTERPRISE / TRIAL /
+    # STARTER, mirroring Kasten-Disco-Lite #14/#38 ordering), and pick in strict
+    # priority ENTERPRISE > TRIAL > STARTER, tie-broken by the nearest real
+    # expiry. A genuine enterprise license therefore always wins over the
+    # bundled starter/trial. When we can only fall back to trial/starter, flag it
+    # so the report never passes the built-in license off as the real entitlement.
     local secret_names sname raw_b64 decoded
-    local starter_decoded="" chosen_decoded="" chosen_exp_epoch=0
+    local ent_decoded="" ent_exp_epoch=0
+    local trial_decoded="" trial_exp_epoch=0
+    local starter_decoded=""
 
     secret_names=$(${K} get secrets -n "${KASTEN_NAMESPACE}" -o json 2>/dev/null \
-        | jq -r '[.items[]? | select(.metadata.name | startswith("k10-license")) | .metadata.name] | .[]' 2>/dev/null || true)
-    # Broaden to any *license* secret if the k10-license* prefix matched nothing.
+        | jq -r '[.items[]? | select(.metadata.name | ascii_downcase | test("license")) | .metadata.name] | .[]' 2>/dev/null || true)
+    # Broaden to any *license* secret if the JSON path matched nothing.
     if [[ -z "${secret_names}" ]]; then
         secret_names=$(${K} get secrets -n "${KASTEN_NAMESPACE}" --no-headers 2>/dev/null \
             | grep -i license | awk '{print $1}' || true)
     fi
 
     for sname in ${secret_names}; do
-        raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" "${sname}" -o jsonpath='{.data.license}' 2>/dev/null \
-            || ${K} get secret -n "${KASTEN_NAMESPACE}" "${sname}" -o jsonpath='{.data.License}' 2>/dev/null || true)
+        raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" "${sname}" -o jsonpath='{.data.license}' 2>/dev/null || true)
+        [[ -z "${raw_b64}" ]] && raw_b64=$(${K} get secret -n "${KASTEN_NAMESPACE}" "${sname}" -o jsonpath='{.data.License}' 2>/dev/null || true)
         [[ -z "${raw_b64}" ]] && continue
         decoded=$(echo "${raw_b64}" | base64 -d 2>/dev/null || echo "${raw_b64}" | base64 -D 2>/dev/null || true)
         [[ -z "${decoded}" ]] && continue
 
-        local c_customer c_id c_end is_starter exp_epoch
+        local c_customer c_id c_end c_customer_lc lic_class exp_epoch
         c_customer=$(yaml_val "${decoded}" "customerName")
         c_id=$(yaml_val "${decoded}" "id")
         # Skip payloads with no recognisable license signature.
         [[ -z "${c_customer}" && -z "${c_id}" ]] && continue
 
-        is_starter=false
-        if [[ "${c_customer}" == "starter-license" || "${c_id}" == starter-* ]]; then
-            is_starter=true
+        # Classify — ORDER MATTERS (KDL #38). TRIAL is tested first on two
+        # independent signals so a trial whose customer name also contains
+        # "starter" never falls through to STARTER. STARTER uses an EXACT
+        # customer-name match (or explicit "starter-" id prefix), never a
+        # substring test. Anything else is a paid ENTERPRISE license.
+        c_customer_lc=$(to_lower "${c_customer}")
+        if [[ "${c_id}" == trial-* || "${c_customer_lc}" == *trial* ]]; then
+            lic_class="TRIAL"
+        elif [[ "${c_customer_lc}" == "starter-license" || "${c_id}" == starter-* ]]; then
+            lic_class="STARTER"
+        else
+            lic_class="ENTERPRISE"
         fi
 
-        if [[ "${is_starter}" == true ]]; then
-            [[ -z "${starter_decoded}" ]] && starter_decoded="${decoded}"
-            continue
-        fi
-
-        # Non-starter candidate: keep the one with the nearest (smallest) real expiry.
         c_end=$(yaml_val "${decoded}" "dateEnd")
         exp_epoch=0
         if [[ -n "${c_end}" && "${c_end}" != "null" ]]; then
             exp_epoch=$(portable_date_epoch "${c_end}")
         fi
-        if [[ -z "${chosen_decoded}" ]]; then
-            chosen_decoded="${decoded}"; chosen_exp_epoch="${exp_epoch}"
-        elif [[ "${exp_epoch}" -gt 0 && ( "${chosen_exp_epoch}" -le 0 || "${exp_epoch}" -lt "${chosen_exp_epoch}" ) ]]; then
-            chosen_decoded="${decoded}"; chosen_exp_epoch="${exp_epoch}"
-        fi
+
+        case "${lic_class}" in
+            ENTERPRISE)
+                if [[ -z "${ent_decoded}" ]]; then
+                    ent_decoded="${decoded}"; ent_exp_epoch="${exp_epoch}"
+                elif [[ "${exp_epoch}" -gt 0 && ( "${ent_exp_epoch}" -le 0 || "${exp_epoch}" -lt "${ent_exp_epoch}" ) ]]; then
+                    ent_decoded="${decoded}"; ent_exp_epoch="${exp_epoch}"
+                fi ;;
+            TRIAL)
+                if [[ -z "${trial_decoded}" ]]; then
+                    trial_decoded="${decoded}"; trial_exp_epoch="${exp_epoch}"
+                elif [[ "${exp_epoch}" -gt 0 && ( "${trial_exp_epoch}" -le 0 || "${exp_epoch}" -lt "${trial_exp_epoch}" ) ]]; then
+                    trial_decoded="${decoded}"; trial_exp_epoch="${exp_epoch}"
+                fi ;;
+            STARTER)
+                [[ -z "${starter_decoded}" ]] && starter_decoded="${decoded}" ;;
+        esac
     done
 
-    # Fall back to the starter license (flagged) when no enterprise license found.
-    local from_starter=false
-    if [[ -z "${chosen_decoded}" && -n "${starter_decoded}" ]]; then
-        chosen_decoded="${starter_decoded}"; from_starter=true
+    # Select in strict priority: ENTERPRISE > TRIAL > STARTER. Flag the fallback
+    # so the report is explicit when only a trial/starter license is present.
+    local chosen_decoded="" fallback_note=""
+    if [[ -n "${ent_decoded}" ]]; then
+        chosen_decoded="${ent_decoded}"
+    elif [[ -n "${trial_decoded}" ]]; then
+        chosen_decoded="${trial_decoded}"; fallback_note=" [trial-license]"
+    elif [[ -n "${starter_decoded}" ]]; then
+        chosen_decoded="${starter_decoded}"; fallback_note=" [starter-license intégrée]"
     fi
 
     if [[ -n "${chosen_decoded}" ]]; then
@@ -830,9 +868,10 @@ get_license_info() {
         LIC_PLATFORM="Kubernetes"
 
         # Make the fallback explicit so the report never silently shows the
-        # built-in starter license as if it were the customer's real entitlement.
-        if [[ "${from_starter}" == true ]]; then
-            LIC_CUSTOMER="${LIC_CUSTOMER} [starter-license intégrée]"
+        # built-in starter/trial license as if it were the customer's real
+        # entitlement.
+        if [[ -n "${fallback_note}" ]]; then
+            LIC_CUSTOMER="${LIC_CUSTOMER}${fallback_note}"
         fi
     fi
 
@@ -1348,7 +1387,8 @@ ${LICENSE_BANNER}
 <tbody>${REPORT_ROWS}</tbody></table>
 <p style="margin:6px 2px 0;font-size:11px;color:#888;">
     Legend: <span style="color:#27AE60;font-weight:600;">N&nbsp;&#10003;</span> completed &nbsp;&bull;&nbsp; <span style="color:#E74C3C;font-weight:700;">N&nbsp;&#10007;</span> failed &nbsp;&bull;&nbsp; <span style="color:#F39C12;">N&nbsp;skip</span> skipped &nbsp;&bull;&nbsp; <span style="color:#888;">N&nbsp;cnl</span> cancelled<br/>
-    <em>Backup</em> = backup + backupCluster &nbsp;&bull;&nbsp; <em>Restore</em> = restore + restoreCluster &nbsp;&bull;&nbsp; <em>Autres</em> = import + report &nbsp;&bull;&nbsp; <em>Run</em> = policy execution wrappers (excluded from total errors)
+    <em>Backup</em> = backup + backupCluster &nbsp;&bull;&nbsp; <em>Restore</em> = restore + restoreCluster &nbsp;&bull;&nbsp; <em>Autres</em> = import + report<br/>
+    <em>Run</em> = number of policy <strong>executions</strong> (each policy run wraps the backup/export/&hellip; sub-actions shown in the other columns) &mdash; counted separately, excluded from total errors to avoid double-counting
 </p>
 
 <h2 style="margin:24px 0 16px;font-size:17px;color:#1B2A4A;border-bottom:3px solid #2E75B6;padding-bottom:8px;">4. Last Policy Run Status</h2>
